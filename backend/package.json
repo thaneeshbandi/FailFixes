@@ -1,0 +1,105 @@
+{
+  "name": "failfixes-backend",
+  "version": "1.0.0",
+  "description": "Backend API for FailFixes - Transform setbacks into comebacks",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "prod": "cross-env NODE_ENV=production node server.js",
+    "test": "cross-env NODE_ENV=test jest --coverage --forceExit --detectOpenHandles --maxWorkers=1",
+    "test:auth": "cross-env NODE_ENV=test jest tests/auth.test.js --forceExit",
+    "test:story": "cross-env NODE_ENV=test jest tests/story.test.js --forceExit",
+    "test:user": "cross-env NODE_ENV=test jest tests/user.test.js --forceExit",
+    "test:models": "cross-env NODE_ENV=test jest tests/models.test.js --forceExit",
+    "test:watch": "cross-env NODE_ENV=test jest --watch --detectOpenHandles",
+    "test:ci": "cross-env NODE_ENV=test jest --coverage --forceExit --detectOpenHandles --maxWorkers=1 --ci",
+    "test:performance": "node scripts/testPerformance.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": [
+      "**/*.js",
+      "!**/node_modules/**",
+      "!**/tests/**",
+      "!**/coverage/**",
+      "!server.js",
+      "!jest.config.js"
+    ],
+    "coveragePathIgnorePatterns": [
+      "/node_modules/",
+      "/tests/",
+      "/coverage/",
+      "server.js"
+    ],
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ],
+    "testTimeout": 15000,
+    "verbose": true,
+    "bail": false,
+    "detectOpenHandles": true,
+    "forceExit": true,
+    "clearMocks": true,
+    "resetMocks": true,
+    "restoreMocks": true
+  },
+  "dependencies": {
+    "axios": "^1.12.1",
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^6.10.0",
+    "express-validator": "^7.2.1",
+    "helmet": "^7.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "moment": "^2.30.1",
+    "mongoose": "^7.5.0",
+    "morgan": "^1.10.0",
+    "nodemailer": "^7.0.11",
+    "redis": "^5.10.0",
+    "resend": "^6.6.0",
+    "socket.io": "^4.8.1",
+    "uuid": "^11.1.0",
+    "validator": "^13.11.0"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "eslint": "^8.47.0",
+    "jest": "^29.6.2",
+    "nodemon": "^3.0.1",
+    "supertest": "^6.3.3"
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "keywords": [
+    "express",
+    "node",
+    "api",
+    "mongodb",
+    "stories",
+    "community",
+    "failfixes",
+    "social",
+    "rest-api",
+    "backend",
+    "socket.io",
+    "real-time"
+  ],
+  "author": "FailFixes Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yamms2340/FailFixes.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yamms2340/FailFixes/issues"
+  },
+  "homepage": "https://github.com/yamms2340/FailFixes#readme"
+}
