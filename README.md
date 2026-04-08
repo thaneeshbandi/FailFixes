@@ -179,7 +179,7 @@ MIT License – see `LICENSE` file for details.
 
 ## 📧 Contact
 
-- Author: **MOKSHA021**  
-- GitHub: https://github.com/MOKSHA021  
-- Project: https://github.com/MOKSHA021/FailFixes
+- Author: **Thaneesh Bandi**  
+- GitHub: https://github.com/thaneeshbandi 
+- Project: https://github.com/thaneeshbandi/FailFixes
 
