@@ -1,6 +1,8 @@
+require('dotenv').config();
+console.log("ENV CHECK:", process.env.MONGODB_URI);
 // server.js
 // Load environment variables from .env
-require('dotenv').config();
+
 
 const express = require('express');
 const http = require('http');

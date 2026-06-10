@@ -1,5 +1,5 @@
 require('dotenv').config();
-
+console.log("MONGO URI:", process.env.MONGODB_URI);
 module.exports = {
   // Server Configuration
   port: process.env.PORT || 5000,
