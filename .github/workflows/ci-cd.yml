@@ -107,17 +107,4 @@ jobs:
           path: frontend/build/
           retention-days: 7
 
-  deploy:
-    name: Deploy to Production
-    needs: [test, lint, build-frontend]
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    steps:
-      - name: Deploy to Render
-        run: |
-          curl -X POST ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-
-      - name: Notify deployment
-        run: |
-          echo "✅ Deployed to production!"
+  
