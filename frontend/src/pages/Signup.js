@@ -443,12 +443,12 @@ const Signup = () => {
 
     try {
       const response = await axios.post(`${API_BASE_URL}/auth/register`, {
-        email: formData.email,
-        username: formData.username,
-        password: formData.password,
-        displayName: formData.displayName || formData.username,
-        allowAnonymous: formData.allowAnonymous,
-      });
+  email: formData.email,
+  username: formData.username,
+  password: formData.password,
+  name: formData.displayName || formData.username,
+  allowAnonymous: formData.allowAnonymous,
+});
 
       if (response.data.success) {
         setErrors({});

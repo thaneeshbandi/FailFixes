@@ -1,9 +1,9 @@
 import axios from 'axios';
 
 // ✅ Base URL: includes /api and has NO trailing slash
-const API_BASE_URL = process.env.REACT_APP_API_URL
-  ? `${process.env.REACT_APP_API_URL}/api/auth/login`
-  : 'http://localhost:5000/api';
+const API_BASE_URL =
+  process.env.REACT_APP_API_URL || 'http://localhost:10000/api';
+
 console.log('🔗 API Base URL:', API_BASE_URL);
 
 const api = axios.create({
