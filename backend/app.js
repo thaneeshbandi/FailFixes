@@ -169,6 +169,7 @@ const allowedOrigins = [
   'http://127.0.0.1:3002',
   'https://failfixes-frontend.onrender.com',
   'https://failfixes.onrender.com',
+  'https://fail-fixes.vercel.app',
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
