@@ -63,7 +63,7 @@ const userAPI = {
   followUser: async (username) => {
     const token = localStorage.getItem('token');
     const response = await axios.post(
-      `${API_BASE_URL}/users/follow/${username}`,
+      `${API_BASE_URL}/users/${username}/follow`,
       {},
       {
         headers: { Authorization: `Bearer ${token}` }
