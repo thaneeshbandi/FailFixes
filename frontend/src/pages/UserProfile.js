@@ -50,7 +50,9 @@ const userAPI = {
     return response;
   },
   trackProfileView: async (profileId) => {
-    const token = localStorage.getItem('token');
+    const token =
+  localStorage.getItem('ff_token') ||
+  localStorage.getItem('token');
     const response = await axios.post(
       `${API_BASE_URL}/users/profile/${profileId}/view`,
       {},
@@ -61,7 +63,9 @@ const userAPI = {
     return response;
   },
   followUser: async (username) => {
-    const token = localStorage.getItem('token');
+    const token =
+  localStorage.getItem('ff_token') ||
+  localStorage.getItem('token');
     const response = await axios.post(
       `${API_BASE_URL}/users/${username}/follow`,
       {},
