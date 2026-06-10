@@ -3,6 +3,7 @@ const router = express.Router();
 
 const {
   followUser,
+  trackProfileView,
   getUserDashboard,
   getSuggestedUsers,
   getUserProfileByUsername,
@@ -34,6 +35,7 @@ router.post('/:username/follow', auth, followUser);
 router.get('/dashboard', auth, getUserDashboard);
 router.get('/suggested', auth, getSuggestedUsers);
 router.get('/profile/:username', optionalAuth, getUserProfileByUsername);
+router.post('/profile/:userId/view', auth, trackProfileView);
 router.get('/me/feed', auth, getUserFeed);
 router.get('/me/stats', auth, getUserStats);
 router.get('/me/stories', auth, getUserStories);
