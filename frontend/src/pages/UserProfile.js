@@ -76,7 +76,9 @@ const userAPI = {
 const storiesAPI = {
   getStoriesByAuthor: async (username, params = {}) => {
     const queryString = new URLSearchParams(params).toString();
-    const response = await axios.get(`${API_BASE_URL}/stories/user/${username}?${queryString}`);
+    const response = await axios.get(
+  `${API_BASE_URL}/stories/author/${username}?${queryString}`
+);
     return response;
   },
   trackStoryView: async (storyId) => {
