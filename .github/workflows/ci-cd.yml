@@ -2,13 +2,29 @@ name: FailFixes CI/CD
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main ]
+    branches: [main, develop]
+
+# Least privilege. The default token permissions can be read/write on every
+# scope for older repositories; nothing in this workflow writes to the repo.
+# Any job needing more must opt in explicitly at the job level.
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref so a rapid push sequence doesn't
+# queue redundant builds.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
 
 jobs:
-  test:
-    name: Run Tests
+  # ---------------------------------------------------------------------------
+  backend-test:
+    name: Backend tests
     runs-on: ubuntu-latest
 
     services:
@@ -21,90 +37,160 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
+      # Third-party and first-party actions are pinned to immutable commit SHAs.
+      # A tag like @v4 is mutable and can be repointed by whoever controls the
+      # action repository.
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
 
       - name: Install backend dependencies
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Generate an ephemeral test JWT secret
+        # The test job must NOT receive the production signing secret. It only
+        # needs *a* valid secret, so one is generated per run and discarded.
+        # (`add-mask` keeps it out of the log even if something echoes it.)
         run: |
-          cd backend
-          npm ci
+          SECRET="$(node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))")"
+          echo "::add-mask::$SECRET"
+          echo "JWT_SECRET=$SECRET" >> "$GITHUB_ENV"
 
       - name: Run backend tests
-        run: |
-          cd backend
-          npm run test:ci
+        working-directory: ./backend
+        run: npm run test:ci
         env:
-          MONGODB_URI: mongodb://localhost:27017/failfixes-test
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
           NODE_ENV: test
+          # Local service container; tests/setup/guardTestDatabase.js refuses to
+          # run against a remote or non-"test" database.
+          MONGODB_URI: mongodb://localhost:27017/failfixes_test
+          TEST_REDIS_URL: redis://localhost:6379
+          FRONTEND_URL: http://localhost:3000
+          BACKEND_URL: http://localhost:5000
 
-      - name: Upload test coverage
-        uses: codecov/codecov-action@v3
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           files: ./backend/coverage/lcov.info
           flags: backend
           fail_ci_if_error: false
+        continue-on-error: true
 
-  lint:
-    name: Lint Code
+  # ---------------------------------------------------------------------------
+  backend-lint:
+    name: Backend lint
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
 
       - name: Install dependencies
-        run: |
-          cd backend
-          npm ci
+        working-directory: ./backend
+        run: npm ci
 
+      # This step previously ended in `|| echo "Linting issues found"`, so it
+      # could never fail — and there was no ESLint config at all, meaning it
+      # errored out on every run and the `||` hid that too. Both are fixed:
+      # backend/.eslintrc.json now exists and lint errors fail the build.
       - name: Run ESLint
-        run: |
-          cd backend
-          npm run lint || echo "Linting issues found"
+        working-directory: ./backend
+        run: npm run lint
 
-  build-frontend:
-    name: Build Frontend
+  # ---------------------------------------------------------------------------
+  frontend-build:
+    name: Frontend build
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
-        run: |
-          cd frontend
-          npm ci
+        working-directory: ./frontend
+        run: npm ci
 
+      # NOTE ON `CI=false`: with CI=true, react-scripts promotes *lint warnings*
+      # to build failures. This codebase has ~41 unused-import warnings that are
+      # not defects. CI=false downgrades those warnings only — a genuine
+      # compile/bundle error still fails this step. Removing the flag is
+      # tracked as cleanup work, not a security control.
       - name: Build frontend
-        run: |
-          cd frontend
-          CI=false npm run build
+        working-directory: ./frontend
+        run: CI=false npm run build
         env:
           REACT_APP_API_URL: ${{ secrets.REACT_APP_API_URL }}
 
+      # Guard against a secret ever being bundled into client-side JS. Anything
+      # shipped to the browser is public by definition.
+      - name: Assert no secrets in the bundle
+        working-directory: ./frontend
+        run: |
+          if grep -rqiE 'mongodb\+srv://|gsk_[A-Za-z0-9]{20}|re_[A-Za-z0-9]{20}|-----BEGIN [A-Z ]*PRIVATE KEY-----' build/static/js/; then
+            echo "::error::A credential-shaped string was found in the built bundle"
+            exit 1
+          fi
+          echo "No credential-shaped strings found in build output."
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: frontend-build
           path: frontend/build/
           retention-days: 7
 
-  
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Production dependencies only, and only high/critical. Auditing devDeps
+      # here would fail permanently on react-scripts' unmaintained build chain
+      # (build-time only, never shipped) and train everyone to ignore this job.
+      - name: Audit backend production dependencies
+        working-directory: ./backend
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit frontend runtime dependencies
+        working-directory: ./frontend
+        # Reported but non-blocking: the remaining advisories are in the CRA
+        # build toolchain, whose only fix is a framework migration.
+        run: npm audit --omit=dev --audit-level=high || true

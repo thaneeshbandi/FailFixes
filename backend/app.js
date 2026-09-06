@@ -1,9 +1,22 @@
+// Refuse to boot on missing/weak secrets before anything else is wired up.
+// Also runs for the test suite, which requires this module directly.
+require("./config/env").validateEnvOrExit();
+
 const express = require("express");
 const cors = require("cors");
+const { corsOptions } = require("./config/cors");
+const { errorHandler } = require("./middleware/errorhandler");
 const helmet = require("helmet");
 const compression = require("compression");
 const morgan = require("morgan");
-const redis = require("redis");
+const {
+  initRedis,
+  cacheMiddleware,
+  invalidateCache,
+  isRedisReady,
+  quitRedis,
+  getClient: getRedisClient,
+} = require("./middleware/cache");
 
 // Import Routes
 const authRoutes = require("./routes/auth");
@@ -14,216 +27,93 @@ const aiRoutes = require("./routes/ai");
 
 const app = express();
 
-// ✅ REDIS CLIENT SETUP
-let redisClient = null;
-let redisConnected = false;
-
-// Initialize Redis only if URL is provided
-if (process.env.REDIS_URL) {
-  redisClient = redis.createClient({
-    url: process.env.REDIS_URL,
-    socket: {
-      reconnectStrategy: (retries) => {
-        if (retries > 10) {
-          console.log("❌ Redis: Max reconnection attempts reached");
-          return new Error("Max reconnection attempts reached");
-        }
-        return Math.min(retries * 100, 3000);
-      },
-    },
-  });
-
-  redisClient.on("connect", () => {
-    console.log("🔄 Redis: Connecting...");
-  });
-
-  redisClient.on("ready", () => {
-    redisConnected = true;
-    console.log("✅ Redis: Connected and ready");
-  });
-
-  redisClient.on("error", (err) => {
-    redisConnected = false;
-    console.warn("⚠️ Redis Error:", err.message);
-  });
-
-  redisClient.on("end", () => {
-    redisConnected = false;
-    console.log("🔌 Redis: Connection closed");
-  });
-
-  // Connect to Redis
-  redisClient.connect().catch((err) => {
-    console.warn("⚠️ Redis connection failed:", err.message);
-    console.log("ℹ️  App will continue without caching");
-  });
-} else {
-  console.log("ℹ️  Redis URL not provided - caching disabled");
-}
-
-// ✅ ENHANCED CACHE MIDDLEWARE WITH PERFORMANCE TRACKING
-const cacheMiddleware = (duration = 300) => {
-  return async (req, res, next) => {
-    const startTime = Date.now();
-
-    // Skip caching if Redis is not connected or in test mode
-    if (!redisConnected || process.env.NODE_ENV === "test") {
-      return next();
-    }
-
-    // Only cache GET requests
-    if (req.method !== "GET") {
-      return next();
-    }
-
-    // Skip caching for authenticated user-specific endpoints
-    const skipPaths = ["/api/auth/me", "/api/users/me", "/api/users/dashboard"];
-    if (skipPaths.some((path) => req.originalUrl.includes(path))) {
-      return next();
-    }
-
-    const cacheKey = `cache:${req.originalUrl}`;
-
-    try {
-      const cachedData = await redisClient.get(cacheKey);
-
-      if (cachedData) {
-        const cacheTime = Date.now() - startTime;
-
-        if (process.env.NODE_ENV === "development") {
-          console.log(`✅ Cache HIT: ${req.originalUrl} - ${cacheTime}ms`);
-        }
-
-        // Add performance headers
-        res.set("X-Response-Time", `${cacheTime}ms`);
-        res.set("X-Cache-Status", "HIT");
-
-        return res.json(JSON.parse(cachedData));
-      }
-
-      if (process.env.NODE_ENV === "development") {
-        console.log(`❌ Cache MISS: ${req.originalUrl}`);
-      }
-
-      // Store original res.json
-      const originalJson = res.json.bind(res);
-
-      // Override res.json to cache the response and track time
-      res.json = (data) => {
-        const totalTime = Date.now() - startTime;
-
-        // Add performance headers
-        res.set("X-Response-Time", `${totalTime}ms`);
-        res.set("X-Cache-Status", "MISS");
-
-        if (process.env.NODE_ENV === "development") {
-          console.log(`📊 DB Query: ${req.originalUrl} - ${totalTime}ms`);
-        }
-
-        // Cache successful responses only
-        if (res.statusCode === 200 && data) {
-          redisClient
-            .setEx(cacheKey, duration, JSON.stringify(data))
-            .catch((err) => {
-              console.warn("⚠️ Cache set error:", err.message);
-            });
-        }
-
-        return originalJson(data);
-      };
-
-      next();
-    } catch (err) {
-      console.warn("⚠️ Cache middleware error:", err.message);
-      next();
-    }
-  };
-};
-
-// ✅ CACHE INVALIDATION HELPER
-const invalidateCache = async (pattern = "*") => {
-  if (!redisConnected) return;
-
-  try {
-    const keys = await redisClient.keys(`cache:${pattern}`);
-    if (keys.length > 0) {
-      await redisClient.del(keys);
-      if (process.env.NODE_ENV === "development") {
-        console.log(`🗑️  Invalidated ${keys.length} cache entries`);
-      }
-    }
-  } catch (err) {
-    console.warn("⚠️ Cache invalidation error:", err.message);
-  }
-};
+// ✅ REDIS CACHE
+// Implemented in middleware/cache.js. Only fully anonymous GET responses are
+// cached; any request carrying credentials bypasses the cache in both
+// directions, so a personalised response (or an owner's unpublished draft) can
+// never be stored and replayed to someone else.
+initRedis();
 
 // Trust proxy for rate limiting (important for Render)
 app.set("trust proxy", 1);
 
-// ✅ CORS Configuration for Render
-const allowedOrigins = [
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-  "http://localhost:3001",
-  "http://localhost:3002",
-  "http://127.0.0.1:3002",
-  "https://failfixes-frontend.onrender.com",
-  "https://failfixes.onrender.com",
-  "https://fail-fixes.vercel.app",
-  process.env.FRONTEND_URL,
-].filter(Boolean);
+// ✅ CORS — single allowlist shared with Socket.IO (config/cors.js).
+// Fails closed: unknown origins get no CORS headers in every environment.
+app.use(cors(corsOptions));
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!origin) return callback(null, true);
-
-      if (allowedOrigins.indexOf(origin) !== -1) {
-        callback(null, true);
-      } else {
-        if (process.env.NODE_ENV !== "production") {
-          console.log("⚠️  CORS blocked origin:", origin);
-          console.log("✅ Allowed origins:", allowedOrigins);
-        }
-        callback(null, process.env.NODE_ENV !== "production");
-      }
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Requested-With",
-      "Accept",
-      "Origin",
-    ],
-    exposedHeaders: ["X-Response-Time", "X-Cache-Status"], // ✅ Expose performance headers
-  }),
-);
-
-app.options("*", cors());
+// The previous `app.options("*", cors())` registered a DEFAULT cors handler,
+// which answers preflights with `Access-Control-Allow-Origin: *`. The middleware
+// above already handles OPTIONS with the strict allowlist, so the wildcard
+// handler is removed rather than left shadowed.
 
 // ✅ BODY PARSING - MUST BE BEFORE ROUTES
-app.use(
-  express.json({
-    limit: "10mb",
-    strict: false,
-  }),
-);
+//
+// The old blanket 10MB limit applied to every route, including /api/auth/login
+// (each attempt runs a cost-12 bcrypt) and /api/ai/generate-story. Combined with
+// the absent rate limiting that was a cheap resource-exhaustion primitive.
+//
+// Limits are now sized to what each route actually accepts. Express applies the
+// *first* matching body parser, so the tighter route-specific parsers are
+// registered before the general one.
+//
+// `strict: true` (the default) also restores rejection of non-object JSON
+// bodies such as `"a string"` or `123`, which downstream code assumes cannot
+// happen.
+const jsonBody = (limit) => express.json({ limit, strict: true });
+
+// Credentials only: a few hundred bytes at most.
+app.use("/api/auth", jsonBody("16kb"));
+// Prompt is capped at 2000 characters by validation.
+app.use("/api/ai", jsonBody("32kb"));
+// Profile fields (bio 500, website 200, …).
+app.use("/api/users", jsonBody("64kb"));
+// Chat messages are capped at 1000 characters.
+app.use("/api/chats", jsonBody("32kb"));
+// Stories are long-form prose; generous but far below 10MB.
+app.use("/api/stories", jsonBody("512kb"));
+
+// Fallback for anything else.
+app.use(jsonBody("256kb"));
 
 app.use(
   express.urlencoded({
     extended: true,
-    limit: "10mb",
+    limit: "64kb",
   }),
 );
 
 // Security middleware
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    // This process serves a JSON API only — it renders no HTML, so a CSP here
+    // governs nothing an attacker could execute. The CSP that actually matters
+    // belongs on the React app's own origin (Vercel/Render static hosting),
+    // where it can constrain script execution and therefore protect the token
+    // in localStorage. A restrictive default-src is set anyway as defence in
+    // depth for any error page or future HTML response: it costs nothing and
+    // cannot break JSON responses.
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        "default-src": ["'none'"],
+        "frame-ancestors": ["'none'"],
+        "base-uri": ["'none'"],
+        "form-action": ["'none'"],
+      },
+    },
     crossOriginEmbedderPolicy: false,
+    // The browser app is served from a different origin than this API, so
+    // cross-origin reads must stay permitted.
     crossOriginResourcePolicy: { policy: "cross-origin" },
+    // HSTS: Render terminates TLS in front of the app. max-age 180 days,
+    // without preload (preloading is a one-way door the operator should opt
+    // into deliberately).
+    hsts: {
+      maxAge: 15552000,
+      includeSubDomains: true,
+      preload: false,
+    },
+    referrerPolicy: { policy: "no-referrer" },
   }),
 );
 
@@ -233,27 +123,9 @@ app.use(compression());
 // Logging
 if (process.env.NODE_ENV === "development") {
   app.use(morgan("dev"));
-
-  app.use((req, res, next) => {
-    console.log(`\n🌐 === REQUEST LOG ===`);
-    console.log(`${req.method} ${req.originalUrl}`);
-    console.log("Headers:", {
-      "content-type": req.headers["content-type"],
-      authorization: req.headers.authorization ? "Bearer [PRESENT]" : "None",
-      origin: req.headers.origin,
-    });
-    if (Object.keys(req.body).length > 0) {
-      console.log("Body:", req.body);
-    }
-    if (Object.keys(req.params).length > 0) {
-      console.log("Params:", req.params);
-    }
-    if (Object.keys(req.query).length > 0) {
-      console.log("Query:", req.query);
-    }
-    console.log("=== END LOG ===\n");
-    next();
-  });
+  // The previous verbose logger here dumped req.body on every request, which
+  // meant cleartext passwords in the dev console (and anywhere those logs were
+  // pasted). morgan already records method/url/status/time.
 } else if (process.env.NODE_ENV === "production") {
   app.use(morgan("combined"));
 }
@@ -266,7 +138,7 @@ app.get("/", (req, res) => {
     version: "1.0.0",
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || "development",
-    cache: redisConnected ? "enabled" : "disabled",
+    cache: isRedisReady() ? "enabled" : "disabled",
     features: [
       "auth",
       "stories",
@@ -274,7 +146,7 @@ app.get("/", (req, res) => {
       "chats",
       "realtime-chat",
       "ai-story-generation",
-      ...(redisConnected ? ["redis-caching", "performance-tracking"] : []),
+      ...(isRedisReady() ? ["redis-caching", "performance-tracking"] : []),
     ],
   });
 });
@@ -289,8 +161,8 @@ app.get("/health", (req, res) => {
     uptime: process.uptime(),
     environment: process.env.NODE_ENV || "development",
     cache: {
-      enabled: redisConnected,
-      type: redisConnected ? "redis" : "none",
+      enabled: isRedisReady(),
+      type: isRedisReady() ? "redis" : "none",
     },
   });
 });
@@ -299,10 +171,10 @@ app.get("/api/health", async (req, res) => {
   let cacheStatus = "disabled";
   let cachePing = null;
 
-  if (redisConnected) {
+  if (isRedisReady()) {
     try {
       const pingStart = Date.now();
-      await redisClient.ping();
+      await getRedisClient().ping();
       cachePing = Date.now() - pingStart;
       cacheStatus = "connected";
     } catch (err) {
@@ -320,7 +192,7 @@ app.get("/api/health", async (req, res) => {
     cache: {
       status: cacheStatus,
       ping: cachePing ? `${cachePing}ms` : null,
-      enabled: redisConnected,
+      enabled: isRedisReady(),
     },
     features: {
       auth: "active",
@@ -329,7 +201,7 @@ app.get("/api/health", async (req, res) => {
       chats: "active",
       socketIO: "active",
       ai: process.env.GROQ_API_KEY ? "active" : "inactive",
-      cache: redisConnected ? "active" : "inactive",
+      cache: isRedisReady() ? "active" : "inactive",
     },
   });
 });
@@ -337,7 +209,7 @@ app.get("/api/health", async (req, res) => {
 // ✅ CACHE STATS ENDPOINT (Development only)
 if (process.env.NODE_ENV === "development") {
   app.get("/api/cache/stats", async (req, res) => {
-    if (!redisConnected) {
+    if (!isRedisReady()) {
       return res.json({
         success: true,
         message: "Cache is disabled",
@@ -346,7 +218,7 @@ if (process.env.NODE_ENV === "development") {
     }
 
     try {
-      const keys = await redisClient.keys("cache:*");
+      const keys = await getRedisClient().keys("cache:anon:*");
       const stats = {
         totalKeys: keys.length,
         keys: keys.slice(0, 20), // Show first 20 keys
@@ -368,7 +240,7 @@ if (process.env.NODE_ENV === "development") {
 
   // Clear cache endpoint
   app.delete("/api/cache/clear", async (req, res) => {
-    if (!redisConnected) {
+    if (!isRedisReady()) {
       return res.json({
         success: false,
         message: "Cache is disabled",
@@ -391,6 +263,33 @@ if (process.env.NODE_ENV === "development") {
   });
 }
 
+// ✅ CACHE INVALIDATION ON WRITES
+// NOTE: this was previously registered *after* the route mounts, so it never
+// executed — a route handler ends the response and later middleware is skipped.
+// The anonymous story cache was therefore only ever cleared by its 300s TTL,
+// meaning a newly published story could stay invisible to logged-out visitors
+// for up to five minutes. Registering it ahead of the routes lets it wrap
+// res.json before a handler is reached.
+app.use((req, res, next) => {
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) {
+    const originalJson = res.json.bind(res);
+
+    res.json = (data) => {
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        // Fire-and-forget: a cache-invalidation failure must not fail the write
+        // that already succeeded.
+        if (req.originalUrl.includes("/stories")) {
+          invalidateCache("/api/stories*").catch(() => {});
+        } else if (req.originalUrl.includes("/users")) {
+          invalidateCache("/api/users*").catch(() => {});
+        }
+      }
+      return originalJson(data);
+    };
+  }
+  next();
+});
+
 // ✅ API ROUTES WITH CACHING
 
 // Auth routes (no caching for auth)
@@ -407,26 +306,6 @@ app.use("/api/chats", chatRoutes);
 
 // AI routes (no caching - always generate fresh)
 app.use("/api/ai", aiRoutes);
-
-// ✅ CACHE INVALIDATION MIDDLEWARE FOR POST/PUT/DELETE
-app.use((req, res, next) => {
-  if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) {
-    const originalJson = res.json.bind(res);
-
-    res.json = async (data) => {
-      // Invalidate relevant cache on data modification
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        if (req.originalUrl.includes("/stories")) {
-          await invalidateCache("/api/stories*");
-        } else if (req.originalUrl.includes("/users")) {
-          await invalidateCache("/api/users*");
-        }
-      }
-      return originalJson(data);
-    };
-  }
-  next();
-});
 
 // ✅ 404 Handler
 app.use("*", (req, res) => {
@@ -491,52 +370,26 @@ app.use("*", (req, res) => {
 });
 
 // ✅ GLOBAL ERROR HANDLER
-app.use((err, req, res, next) => {
-  if (process.env.NODE_ENV !== "test") {
-    console.error("\n❌ === GLOBAL ERROR ===");
-    console.error("URL:", req.originalUrl);
-    console.error("Method:", req.method);
-    console.error("Error:", err.message);
-    if (process.env.NODE_ENV === "development") {
-      console.error("Stack:", err.stack);
-    }
-    console.error("=== END ERROR ===\n");
-  }
-
-  const statusCode = err.statusCode || err.status || 500;
-
-  res.status(statusCode).json({
-    success: false,
-    message:
-      process.env.NODE_ENV === "production"
-        ? "Internal server error"
-        : err.message,
-    ...(process.env.NODE_ENV === "development" && {
-      error: err.message,
-      stack: err.stack,
-    }),
-  });
-});
+// Single implementation, in middleware/errorhandler.js. It was previously
+// duplicated (an inline handler here plus an unmounted module) and this one
+// returned `stack: err.stack` to the client outside production.
+app.use(errorHandler);
 
 // ✅ GRACEFUL SHUTDOWN
 process.on("SIGTERM", async () => {
   console.log("📴 SIGTERM received, shutting down gracefully...");
-  if (redisClient) {
-    await redisClient.quit();
-  }
+  await quitRedis();
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
   console.log("📴 SIGINT received, shutting down gracefully...");
-  if (redisClient) {
-    await redisClient.quit();
-  }
+  await quitRedis();
   process.exit(0);
 });
 
 // ✅ Export app and Redis client
 module.exports = app;
-module.exports.redisClient = redisClient;
+module.exports.redisClient = getRedisClient();
 module.exports.invalidateCache = invalidateCache;
 module.exports.cacheMiddleware = cacheMiddleware;

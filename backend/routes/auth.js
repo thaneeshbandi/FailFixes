@@ -11,29 +11,21 @@ const {
   validateSignup,
   validateLogin,
 } = require('../middleware/validation');
+const { authLimiter } = require('../middleware/rateLimit');
 
-// Add logging middleware for debugging
-router.use((req, res, next) => {
-  console.log(`\n🔐 AUTH ROUTE: ${req.method} ${req.originalUrl}`);
-  console.log('Headers:', {
-    'content-type': req.headers['content-type'],
-    authorization: req.headers.authorization || 'None',
-    origin: req.headers.origin,
-  });
-  console.log('Body:', req.body);
-  console.log('Params:', req.params);
-  console.log('Query:', req.query);
-  next();
-});
+// NOTE: a debug middleware previously logged `req.headers.authorization` and
+// `req.body` on every auth request, writing raw bearer tokens and cleartext
+// passwords into the production log stream. Auth traffic is already covered by
+// the morgan access log in app.js, so nothing request-specific is logged here.
 
 // POST /api/auth/register - Register new user (for your frontend)
-router.post('/register', validateSignup, signup);
+router.post('/register', authLimiter, validateSignup, signup);
 
 // POST /api/auth/signup - Alternative register route
-router.post('/signup', validateSignup, signup);
+router.post('/signup', authLimiter, validateSignup, signup);
 
 // POST /api/auth/login - Login user
-router.post('/login', validateLogin, login);
+router.post('/login', authLimiter, validateLogin, login);
 
 // GET /api/auth/me - Get current user info
 router.get('/me', auth, getMe);

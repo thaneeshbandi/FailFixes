@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const validator = require('validator');
+const { signAuthToken } = require('../utils/token');
 
 const userSchema = new mongoose.Schema(
   {
@@ -18,10 +19,18 @@ const userSchema = new mongoose.Schema(
       unique: true,
       lowercase: true,
       trim: true,
-      match: [
-        /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/,
-        'Please enter a valid email',
-      ],
+      // Was a hand-rolled regex ending in `(\.\w{2,3})+$`, which capped the TLD at
+      // three characters and therefore rejected legitimate addresses on .tech,
+      // .online, .info, .agency, .museum, and so on. Delegating to `validator`
+      // makes this schema-level check identical to the express-validator
+      // `isEmail()` already applied at the API layer, so the two layers can no
+      // longer disagree. `validator.isEmail` also enforces the RFC 5321 length
+      // limits (local part <= 64, domain labels <= 63), so no separate cap is
+      // needed here.
+      validate: {
+        validator: (value) => validator.isEmail(value),
+        message: 'Please enter a valid email',
+      },
     },
     
     username: {
@@ -141,6 +150,12 @@ const userSchema = new mongoose.Schema(
     
     lastLogin: { type: Date, default: null },
     loginCount: { type: Number, default: 0 },
+
+    // Incremented to revoke every JWT issued for this account (logout-everywhere,
+    // password change, forced sign-out). Checked on every authenticated request.
+    // Deliberately NOT `select: false`: it must be present on every load that
+    // signs or verifies a token, and it is stripped from responses by toJSON below.
+    tokenVersion: { type: Number, default: 0 },
   },
   {
     timestamps: true,
@@ -148,6 +163,7 @@ const userSchema = new mongoose.Schema(
       virtuals: true,
       transform: (doc, ret) => {
         delete ret.password;
+        delete ret.tokenVersion;
         return ret;
       },
     },
@@ -169,8 +185,8 @@ userSchema.virtual('isFollowable').get(function () {
 });
 
 // ========== INDEXES ==========
-userSchema.index({ email: 1 });
-userSchema.index({ username: 1 });
+// email and username indexes come from their field-level `unique: true`
+// (username is also sparse). Re-declaring them here collided on index name.
 userSchema.index({ name: 1 });
 userSchema.index({ createdAt: -1 });
 userSchema.index({ 'stats.followersCount': -1 });
@@ -207,19 +223,9 @@ userSchema.methods.comparePassword = async function (candidatePassword) {
 };
 
 userSchema.methods.generateAuthToken = function () {
-  if (!process.env.JWT_SECRET) {
-    throw new Error('JWT_SECRET is not defined in environment variables');
-  }
-  return jwt.sign(
-    {
-      id: this._id,
-      username: this.username || this.name,
-      role: this.role,
-      displayUsername: this.displayUsername,
-    },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRE || '7d' }
-  );
+  // Delegates to utils/token.js so the algorithm pin, issuer/audience and expiry
+  // stay identical to what middleware/auth.js and the Socket.IO handshake verify.
+  return signAuthToken(this);
 };
 
 userSchema.methods.isFollowing = function (userId) {

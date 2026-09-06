@@ -1,0 +1,19 @@
+# Repo-root ignores. Per-package rules live in backend/.gitignore and
+# frontend/.gitignore.
+
+# Generated directory-tree dump (includes node_modules; ~7.5 MB)
+structure.txt
+
+# OS cruft
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# Environment files must never be committed at any level
+.env
+.env.local
+.env.*.local

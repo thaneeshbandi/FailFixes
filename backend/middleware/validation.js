@@ -2,18 +2,38 @@
 const { body, param, query, validationResult } = require('express-validator');
 
 // ========== ERROR HANDLER ==========
+
+// Fields whose *value* must never be echoed back to the client or written to a
+// log. Previously a too-short password was returned verbatim in the 400 body
+// and printed by console.log — i.e. the API reflected the user's password.
+const SENSITIVE_FIELDS = new Set([
+  'password',
+  'currentPassword',
+  'newPassword',
+  'confirmPassword',
+  'token',
+]);
+
 exports.handleValidation = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
-    console.log('Validation errors:', errors.array());
+    const formatted = errors.array().map(e => ({
+      // `field`/`message` are what this API has always returned;
+      // `param`/`msg` are aliases the React signup form reads.
+      field: e.path,
+      param: e.path,
+      message: e.msg,
+      msg: e.msg,
+      ...(SENSITIVE_FIELDS.has(e.path) ? {} : { value: e.value }),
+    }));
+
+    // Log field names only — never the submitted values.
+    console.warn('Validation failed for fields:', formatted.map(f => f.field).join(', '));
+
     return res.status(400).json({
       success: false,
       message: 'Validation failed',
-      errors: errors.array().map(e => ({
-        field: e.path,
-        message: e.msg,
-        value: e.value
-      }))
+      errors: formatted
     });
   }
   next();
@@ -307,5 +327,60 @@ exports.validateSearch = [
     .isIn(['stories', 'users', 'all'])
     .withMessage('Search type must be stories, users, or all'),
   
+  exports.handleValidation
+];
+
+// ========== AI VALIDATION ==========
+// Mirrors the caps in controllers/siController.js. Validating here means a
+// malformed or oversized prompt is rejected before it reaches the controller
+// (and long before it could reach the paid upstream API).
+exports.validateAiPrompt = [
+  body('prompt')
+    .exists({ checkNull: true }).withMessage('Prompt is required')
+    .bail()
+    .isString().withMessage('Prompt must be a string')
+    .bail()
+    .trim()
+    .isLength({ min: 3, max: 2000 })
+    .withMessage('Prompt must be between 3 and 2000 characters'),
+
+  exports.handleValidation
+];
+
+// ========== PARAM VALIDATION ==========
+// Usernames appear in path segments and are used to build (escaped) regexes.
+// Constraining the shape keeps pathological inputs away from the query layer.
+exports.validateUsernameParam = [
+  param('username')
+    .isString()
+    .trim()
+    .isLength({ min: 1, max: 50 })
+    .withMessage('Invalid username'),
+  exports.handleValidation
+];
+
+exports.validateAuthorUsernameParam = [
+  param('authorUsername')
+    .isString()
+    .trim()
+    .isLength({ min: 1, max: 50 })
+    .withMessage('Invalid author username'),
+  exports.handleValidation
+];
+
+exports.validateChatIdParam = [
+  param('chatId').isMongoId().withMessage('Invalid chat ID'),
+  exports.handleValidation
+];
+
+exports.validateUserIdParam = [
+  param('userId').isMongoId().withMessage('Invalid user ID'),
+  exports.handleValidation
+];
+
+// Pagination shared by list endpoints.
+exports.validatePagination = [
+  query('page').optional().isInt({ min: 1, max: 10000 }).withMessage('Invalid page'),
+  query('limit').optional().isInt({ min: 1, max: 50 }).withMessage('Limit must be between 1 and 50'),
   exports.handleValidation
 ];

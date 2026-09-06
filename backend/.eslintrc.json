@@ -1,0 +1,57 @@
+{
+  "root": true,
+  "env": {
+    "node": true,
+    "es2022": true,
+    "jest": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "script"
+  },
+  "extends": ["eslint:recommended"],
+  "ignorePatterns": [
+    "node_modules/",
+    "coverage/",
+    "hooks/",
+    "*.min.js"
+  ],
+  "rules": {
+    "no-unused-vars": [
+      "error",
+      {
+        "args": "after-used",
+        "argsIgnorePattern": "^_|^next$",
+        "varsIgnorePattern": "^_",
+        "caughtErrors": "none"
+      }
+    ],
+
+    "no-console": "off",
+
+    "eqeqeq": ["warn", "smart"],
+    "no-var": "error",
+    "prefer-const": "warn",
+
+    "no-throw-literal": "error",
+    "no-return-await": "warn",
+    "require-atomic-updates": "warn",
+    "no-await-in-loop": "off",
+
+    "no-prototype-builtins": "error",
+    "no-eval": "error",
+    "no-implied-eval": "error",
+    "no-new-func": "error",
+    "no-script-url": "error",
+    "no-proto": "error",
+    "no-extend-native": "error"
+  },
+  "overrides": [
+    {
+      "files": ["tests/**/*.js", "test/**/*.js", "scripts/**/*.js"],
+      "rules": {
+        "no-unused-vars": "warn"
+      }
+    }
+  ]
+}

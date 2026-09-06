@@ -1,5 +1,4 @@
 require('dotenv').config();
-console.log("MONGO URI:", process.env.MONGODB_URI);
 module.exports = {
   // Server Configuration
   port: process.env.PORT || 5000,
@@ -20,9 +19,14 @@ module.exports = {
   },
   
   // JWT Configuration
+  // NOTE: nothing reads this block — utils/token.js is the single authoritative
+  // JWT implementation (signing + verification + defaults). It is kept only so
+  // the config file stays a complete description of the environment, and its
+  // default is aligned with utils/token.js DEFAULT_EXPIRY to avoid drift.
   jwt: {
-    secret: process.env.JWT_SECRET || 'fallback-secret-key-change-in-production',
-    expire: process.env.JWT_EXPIRE || '7d',
+    // No fallback secret: config/env.js refuses to start without a strong one.
+    secret: process.env.JWT_SECRET,
+    expire: process.env.JWT_EXPIRE || require('../utils/token').DEFAULT_EXPIRY,
     refreshSecret: process.env.JWT_REFRESH_SECRET,
     refreshExpire: process.env.JWT_REFRESH_EXPIRE || '30d'
   },

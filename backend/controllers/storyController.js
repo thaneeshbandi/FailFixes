@@ -1,8 +1,59 @@
 const Story = require('../models/Story');
 const User = require('../models/User');
 const mongoose = require('mongoose');
+const { buildAllowedUpdate, STORY_UPDATE_SPEC, summariseRejected } = require('../utils/allowedUpdates');
+const {
+  exactInsensitive,
+  containsInsensitive,
+  asString,
+  asEnum,
+  asBoundedInt,
+} = require('../utils/queryHelpers');
+
+const VALID_SORTS = ['recent', 'popular', 'views', 'trending'];
+const VALID_AUTHOR_SORTS = ['createdAt', 'publishedAt', 'title', 'stats.views', 'stats.likes'];
+const MAX_SEARCH_LENGTH = 100;
+
+/**
+ * Per-(user, story) view-throttle state.
+ *
+ * This Map previously grew for the lifetime of the process — entries were never
+ * removed, so it leaked memory in proportion to (users x stories viewed). It is
+ * also per-process, so it does nothing once the app runs more than one instance.
+ *
+ * Kept as an in-process best-effort throttle (that is all it ever was), but now
+ * bounded: entries expire and the map is swept, with a hard cap as a backstop.
+ */
+const VIEW_WINDOW_MS = 60 * 60 * 1000; // an entry is meaningless after an hour
+const VIEW_MAP_MAX_ENTRIES = 10000;
+const VIEW_SWEEP_INTERVAL = 500; // sweep every N writes
 
 const userViewCounts = new Map();
+let viewWritesSinceSweep = 0;
+
+function sweepViewCounts(now = Date.now()) {
+  for (const [key, entry] of userViewCounts) {
+    if (now - entry.lastView > VIEW_WINDOW_MS) userViewCounts.delete(key);
+  }
+  // Backstop: if still oversized, drop oldest-inserted entries (Map preserves
+  // insertion order) until back under the cap.
+  if (userViewCounts.size > VIEW_MAP_MAX_ENTRIES) {
+    const excess = userViewCounts.size - VIEW_MAP_MAX_ENTRIES;
+    let dropped = 0;
+    for (const key of userViewCounts.keys()) {
+      userViewCounts.delete(key);
+      if (++dropped >= excess) break;
+    }
+  }
+}
+
+function recordView(key, entry) {
+  userViewCounts.set(key, entry);
+  if (++viewWritesSinceSweep >= VIEW_SWEEP_INTERVAL) {
+    viewWritesSinceSweep = 0;
+    sweepViewCounts();
+  }
+}
 
 // ✅ GET ALL STORIES
 exports.getAllStories = async (req, res) => {
@@ -18,30 +69,42 @@ exports.getAllStories = async (req, res) => {
 
     const query = { status: 'published' };
 
-    if (category && category !== 'all') query.category = category;
-    if (authorUsername) query.authorUsername = authorUsername;
+    // Type-guard every externally supplied filter. Express turns
+    // `?category[$ne]=x` into an object; assigning that straight into the query
+    // would inject a MongoDB operator.
+    const categoryFilter = asString(category);
+    if (categoryFilter && categoryFilter !== 'all') query.category = categoryFilter;
 
-    if (search && search.trim()) {
+    const authorFilter = asString(authorUsername);
+    if (authorFilter) query.authorUsername = authorFilter;
+
+    const searchTerm = asString(search)?.trim();
+    if (searchTerm) {
+      // Escaped + length-capped: the raw value used to be interpolated into a
+      // regex evaluated against every story's full `content`.
+      const pattern = containsInsensitive(searchTerm, MAX_SEARCH_LENGTH);
       query.$or = [
-        { title: { $regex: search.trim(), $options: 'i' } },
-        { content: { $regex: search.trim(), $options: 'i' } },
-        { authorUsername: { $regex: search.trim(), $options: 'i' } }
+        { title: pattern },
+        { content: pattern },
+        { authorUsername: pattern }
       ];
     }
 
+    const effectiveSort = asEnum(sortBy, VALID_SORTS, 'recent');
     let sortOptions = {};
-    switch (sortBy) {
+    switch (effectiveSort) {
       case 'popular':
         sortOptions = { 'stats.likes': -1, 'stats.views': -1 };
         break;
       case 'views':
         sortOptions = { 'stats.views': -1 };
         break;
-      case 'trending':
+      case 'trending': {
         const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
         query.createdAt = { $gte: oneWeekAgo };
         sortOptions = { 'stats.views': -1, 'stats.likes': -1 };
         break;
+      }
       case 'recent':
       default:
         sortOptions = { createdAt: -1 };
@@ -111,7 +174,15 @@ exports.getAllStories = async (req, res) => {
         hasPrev: pageNum > 1,
         limit: limitNum
       },
-      filters: { category: category || 'all', search: search || '', sortBy, authorUsername }
+      // Echo the *effective* filters (post type-guard), not the raw query —
+      // reflecting `req.query` verbatim hands an attacker-supplied object back
+      // to the client.
+      filters: {
+        category: categoryFilter || 'all',
+        search: searchTerm || '',
+        sortBy: effectiveSort,
+        authorUsername: authorFilter,
+      }
     });
   } catch (err) {
     console.error('❌ Get stories error:', err);
@@ -158,13 +229,17 @@ exports.getStoryById = async (req, res) => {
     let shouldIncrement = true;
 
     if (userId && userKey) {
-      const userViewData = userViewCounts.get(userKey) || { count: 0, lastView: 0 };
+      const stored = userViewCounts.get(userKey);
+      // Treat an expired entry as absent so a returning visitor isn't blocked
+      // forever by a stale count.
+      const userViewData =
+        stored && now - stored.lastView <= VIEW_WINDOW_MS ? stored : { count: 0, lastView: 0 };
       const timeSinceLastView = now - userViewData.lastView;
 
       if (timeSinceLastView < 5000 || userViewData.count >= 5 || isOwner) {
         shouldIncrement = false;
       } else {
-        userViewCounts.set(userKey, {
+        recordView(userKey, {
           count: userViewData.count + 1,
           lastView: now
         });
@@ -384,7 +459,6 @@ exports.trackStoryView = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error tracking story view',
-      error: error.message 
     });
   }
 };
@@ -400,12 +474,14 @@ exports.getStoriesByAuthor = async (req, res) => {
       order = 'desc' 
     } = req.query;
 
-    console.log('📚 Fetching stories for author:', authorUsername);
+    const pageNum = asBoundedInt(page, { min: 1, max: 10000, fallback: 1 });
+    const limitNum = asBoundedInt(limit, { min: 1, max: 50, fallback: 20 });
 
+    const authorPattern = exactInsensitive(authorUsername);
     const author = await User.findOne({
       $or: [
-        { username: { $regex: new RegExp(`^${authorUsername}$`, 'i') } },
-        { name: { $regex: new RegExp(`^${authorUsername}$`, 'i') } }
+        { username: authorPattern },
+        { name: authorPattern }
       ]
     });
     
@@ -416,8 +492,10 @@ exports.getStoriesByAuthor = async (req, res) => {
       });
     }
 
+    // Sort key must be allowlisted; `?sort=<anything>` was previously used
+    // verbatim as a MongoDB sort field.
     const sortObj = {};
-    sortObj[sort] = order === 'desc' ? -1 : 1;
+    sortObj[asEnum(sort, VALID_AUTHOR_SORTS, 'createdAt')] = order === 'desc' ? -1 : 1;
 
     const stories = await Story.find({ 
       $or: [
@@ -445,8 +523,8 @@ exports.getStoriesByAuthor = async (req, res) => {
     })
       .populate('author', 'username name avatar bio')
       .sort(sortObj)
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit))
+      .limit(limitNum)
+      .skip((pageNum - 1) * limitNum)
       .lean();
 
     const totalStories = await Story.countDocuments({ 
@@ -480,11 +558,11 @@ exports.getStoriesByAuthor = async (req, res) => {
       success: true,
       stories,
       pagination: {
-        currentPage: parseInt(page),
+        currentPage: pageNum,
         totalStories,
-        totalPages: Math.ceil(totalStories / parseInt(limit)),
-        hasNext: page * limit < totalStories,
-        hasPrev: page > 1
+        totalPages: Math.ceil(totalStories / limitNum),
+        hasNext: pageNum * limitNum < totalStories,
+        hasPrev: pageNum > 1
       },
       author: {
         _id: author._id,
@@ -497,7 +575,6 @@ exports.getStoriesByAuthor = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching stories',
-      error: error.message 
     });
   }
 };
@@ -612,7 +689,6 @@ exports.likeStory = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error toggling like',
-      error: err.message
     });
   }
 };
@@ -723,7 +799,6 @@ exports.addComment = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error adding comment',
-      error: err.message
     });
   }
 };
@@ -733,7 +808,6 @@ exports.updateStory = async (req, res) => {
   try {
     const storyId = req.params.id;
     const userId = req.user._id;
-    const updates = req.body;
 
     if (!mongoose.Types.ObjectId.isValid(storyId)) {
       return res.status(400).json({ 
@@ -751,10 +825,34 @@ exports.updateStory = async (req, res) => {
       });
     }
 
+    // Ownership check (was already correct) — this only says *who* may write.
     if (story.author.toString() !== userId.toString()) {
       return res.status(403).json({ 
         success: false, 
         message: 'Not authorized to update this story' 
+      });
+    }
+
+    // SECURITY: ...and this says *what* they may write. Previously `$set: req.body`
+    // let an author reassign `author` to another user, forge `likes`/`stats.views`,
+    // inject `comments` attributed to other accounts, or flip `featured` /
+    // `moderationStatus`.
+    const { updates, rejected } = buildAllowedUpdate(req.body, STORY_UPDATE_SPEC);
+
+    if (rejected.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Request contains fields that cannot be updated',
+        code: 'FORBIDDEN_FIELDS',
+        fields: summariseRejected(rejected),
+      });
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No updatable fields supplied',
+        code: 'EMPTY_UPDATE',
       });
     }
 
@@ -851,31 +949,41 @@ exports.getComments = async (req, res) => {
       });
     }
 
-    const story = await Story.findById(storyId)
-      .populate({
-        path: 'comments.user',
-        select: 'name username avatar'
-      })
-      .select('comments');
+    const pageNum = asBoundedInt(page, { min: 1, max: 10000, fallback: 1 });
+    const limitNum = asBoundedInt(limit, { min: 1, max: 50, fallback: 10 });
+    const startIndex = (pageNum - 1) * limitNum;
 
-    if (!story) {
+    // Previously this loaded the whole story document — full content plus every
+    // comment — and sliced in JS to return 10. $slice pages inside MongoDB.
+    const [doc] = await Story.aggregate([
+      { $match: { _id: new mongoose.Types.ObjectId(storyId) } },
+      {
+        $project: {
+          totalComments: { $size: { $ifNull: ['$comments', []] } },
+          comments: { $slice: [{ $ifNull: ['$comments', []] }, startIndex, limitNum] },
+        },
+      },
+    ]);
+
+    if (!doc) {
       return res.status(404).json({ 
         success: false, 
         message: 'Story not found' 
       });
     }
 
-    const startIndex = (parseInt(page) - 1) * parseInt(limit);
-    const endIndex = startIndex + parseInt(limit);
-    const comments = story.comments.slice(startIndex, endIndex);
+    const comments = await User.populate(doc.comments, {
+      path: 'user',
+      select: 'name username avatar',
+    });
 
     res.json({ 
       success: true, 
       comments,
       pagination: {
-        currentPage: parseInt(page),
-        totalComments: story.comments.length,
-        totalPages: Math.ceil(story.comments.length / parseInt(limit))
+        currentPage: pageNum,
+        totalComments: doc.totalComments,
+        totalPages: Math.ceil(doc.totalComments / limitNum)
       }
     });
   } catch (err) {
@@ -885,4 +993,13 @@ exports.getComments = async (req, res) => {
       message: 'Error fetching comments' 
     });
   }
+};
+
+// Exported for tests only.
+exports.__viewCountsInternals = {
+  userViewCounts,
+  sweepViewCounts,
+  recordView,
+  VIEW_WINDOW_MS,
+  VIEW_MAP_MAX_ENTRIES,
 };

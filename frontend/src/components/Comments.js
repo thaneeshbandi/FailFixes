@@ -7,6 +7,10 @@ import { Send, MoreVert, Reply } from '@mui/icons-material';
 import { styled } from '@mui/material/styles';
 import { formatDistanceToNow } from 'date-fns';
 
+// Was hardcoded to http://localhost:5000 — comments were therefore broken
+// (and mixed-content) in every deployed environment.
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+
 const CommentsContainer = styled(Paper)(({ theme }) => ({
   background: 'linear-gradient(135deg, rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.8))',
   backdropFilter: 'blur(15px)',
@@ -53,7 +57,7 @@ function Comments({ storyId, initialCommentsCount = 0 }) {
   const fetchComments = async () => {
     try {
       setLoading(true);
-      const response = await fetch(`http://localhost:5000/api/stories/${storyId}/comments`);
+      const response = await fetch(`${API_BASE_URL}/stories/${storyId}/comments`);
       const data = await response.json();
 
       if (response.ok) {
@@ -83,7 +87,7 @@ function Comments({ storyId, initialCommentsCount = 0 }) {
       setSubmitting(true);
       setError('');
 
-      const response = await fetch(`http://localhost:5000/api/stories/${storyId}/comment`, {
+      const response = await fetch(`${API_BASE_URL}/stories/${storyId}/comment`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

@@ -3,6 +3,10 @@ import { IconButton, Typography, Box, Tooltip, CircularProgress } from '@mui/mat
 import { Favorite, FavoriteOutlined } from '@mui/icons-material';
 import { styled } from '@mui/material/styles';
 
+// Was hardcoded to http://localhost:5000 — the like button was therefore
+// broken (and mixed-content) in every deployed environment.
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+
 // 🎯 FIXED: Filter out isLiked prop to prevent React warning
 const LikeButton = styled(({ isLiked, ...other }) => <IconButton {...other} />)(({ theme, isLiked }) => ({
   display: 'flex',
@@ -57,7 +61,7 @@ function LikeButtonComponent({ storyId, initialLikes = 0, initialIsLiked = false
       setIsLiked(newIsLiked);
       setLikesCount(newLikesCount);
 
-      const response = await fetch(`http://localhost:5000/api/stories/${storyId}/like`, {
+      const response = await fetch(`${API_BASE_URL}/stories/${storyId}/like`, {
         method: 'PATCH',
         headers: {
           'Authorization': `Bearer ${token}`,

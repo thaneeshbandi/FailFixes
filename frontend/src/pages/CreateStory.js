@@ -454,17 +454,31 @@ function CreateStory() {
   });
 
   // AI story handlers
+  const MAX_AI_PROMPT = 2000; // must match MAX_PROMPT_LENGTH in the backend controller
+
   const handleGenerateAI = async () => {
     if (!aiInput.trim()) {
       setSnackbar({ open: true, message: "Please provide a topic or idea for AI", severity: "warning" });
       return;
     }
+    if (aiInput.trim().length > MAX_AI_PROMPT) {
+      setSnackbar({ open: true, message: `Prompt cannot exceed ${MAX_AI_PROMPT} characters`, severity: "warning" });
+      return;
+    }
     setAILoading(true);
     try {
+      // The AI endpoint now requires authentication (it proxies a paid LLM API
+      // and was previously callable by anyone on the internet).
+      const token = localStorage.getItem('token') || localStorage.getItem('ff_token');
+      if (!token) throw new Error('Please log in to use AI generation.');
+
       const res = await fetch(`${process.env.REACT_APP_API_URL}/ai/generate-story`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: aiInput })
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ prompt: aiInput.trim() })
       });
       const data = await res.json();
       if (!res.ok) {

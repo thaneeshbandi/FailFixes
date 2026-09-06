@@ -1,66 +1,44 @@
 const User = require('../models/User');
 const Story = require('../models/Story');
-const mongoose = require('mongoose');
+const { buildAllowedUpdate, PROFILE_UPDATE_SPEC, summariseRejected } = require('../utils/allowedUpdates');
+const {
+  exactInsensitive,
+  containsInsensitive,
+  asEnum,
+  asBoundedInt,
+} = require('../utils/queryHelpers');
+
+const VALID_STORY_STATUSES = ['draft', 'published', 'archived'];
+const VALID_USER_STORY_SORTS = ['createdAt', 'publishedAt', 'title', 'stats.views', 'stats.likes'];
+
+/**
+ * The "stories authored by this user" filter, which was duplicated verbatim in
+ * getUserDashboard / getUserStats / getUserStories / getUserProfileByUsername.
+ */
+function buildUserStoryFilter(userId, username) {
+  return {
+    $or: [{ author: userId }, { authorUsername: username }],
+    $and: [
+      {
+        $or: [
+          { type: { $exists: false } },
+          { type: 'story' },
+          { type: 'fail_story' },
+        ],
+      },
+      { category: { $ne: 'impact' } },
+    ],
+  };
+}
 
 // 🎯 BULLETPROOF FOLLOW FUNCTION
 
-// ✅ GRAPH-BASED: Get suggested users with multiple strategies
-exports.getSuggestedUsers = async (req, res) => {
-  console.log('\n🤝 === GET SUGGESTED USERS (GRAPH-BASED) ===');
-  
-  try {
-    const currentUserId = req.user._id;
-    const { limit = 10, page = 1 } = req.query;
-    
-    console.log('Request details:', {
-      userId: currentUserId.toString(),
-      limit,
-      page,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Use the enhanced static method
-    const suggestedUsers = await User.findSuggestedUsers(
-      currentUserId,
-      parseInt(limit) * parseInt(page)
-    );
-    
-    // Paginate results
-    const start = (parseInt(page) - 1) * parseInt(limit);
-    const end = start + parseInt(limit);
-    const paginatedUsers = suggestedUsers.slice(start, end);
-    
-    console.log('✅ Suggestions generated:', {
-      totalSuggestions: suggestedUsers.length,
-      returnedCount: paginatedUsers.length,
-      strategies: [...new Set(suggestedUsers.flatMap(u => u.reasons))]
-    });
-    
-    res.json({
-      success: true,
-      users: paginatedUsers,
-      total: suggestedUsers.length,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(suggestedUsers.length / parseInt(limit)),
-        hasNext: end < suggestedUsers.length,
-        hasPrev: parseInt(page) > 1
-      },
-      algorithm: 'hybrid_graph',
-      strategies: ['friends_of_friends', 'similar_interests', 'trending']
-    });
-    
-    console.log('=== END GET SUGGESTED USERS ===\n');
-    
-  } catch (err) {
-    console.error('❌ Get suggested users error:', err);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error fetching suggested users',
-      error: process.env.NODE_ENV === 'development' ? err.message : undefined
-    });
-  }
-};
+// NOTE: a second, graph-based getSuggestedUsers (User.findSuggestedUsers with
+// $graphLookup: friends-of-friends + similar-interests + trending) was defined
+// here. It was dead code — the simpler implementation further down in this file
+// redefined `exports.getSuggestedUsers` and silently won, so the graph version
+// never executed. Removed to leave one reachable implementation. The model
+// static User.findSuggestedUsers is retained if you want to switch to it.
 
 exports.followUser = async (req, res) => {
   const startTime = Date.now();
@@ -104,10 +82,14 @@ exports.followUser = async (req, res) => {
       });
     }
 
+    // Escaped exact match: `targetUsername` used to be interpolated raw into a
+    // RegExp, so `.*` matched an arbitrary user and a backtracking pattern was a
+    // cheap DoS.
+    const targetPattern = exactInsensitive(targetUsername);
     const userToFollow = await User.findOne({
       $or: [
-        { username: { $regex: new RegExp(`^${targetUsername}$`, 'i') } },
-        { name: { $regex: new RegExp(`^${targetUsername}$`, 'i') } }
+        { username: targetPattern },
+        { name: targetPattern }
       ]
     }).select('_id username name followers following stats');
 
@@ -250,7 +232,6 @@ exports.trackProfileView = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error tracking profile view',
-      error: error.message 
     });
   }
 };
@@ -264,10 +245,11 @@ exports.getUserProfileByUsername = async (req, res) => {
     console.log('👤 Fetching profile for username:', username);
 
     // Find user by username with case-insensitive search
+    const usernamePattern = exactInsensitive(username);
     const user = await User.findOne({
       $or: [
-        { username: { $regex: new RegExp(`^${username}$`, 'i') } },
-        { name: { $regex: new RegExp(`^${username}$`, 'i') } }
+        { username: usernamePattern },
+        { name: usernamePattern }
       ]
     })
       .select('-password -email')
@@ -392,7 +374,6 @@ exports.getUserProfileByUsername = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching user profile',
-      error: error.message 
     });
   }
 };
@@ -416,7 +397,7 @@ exports.searchUsers = async (req, res) => {
     }
 
     const searchQuery = q.trim();
-    const searchRegex = new RegExp(searchQuery, 'i');
+    const searchRegex = containsInsensitive(searchQuery, 100);
     
     const users = await User.find({
       $or: [
@@ -462,7 +443,6 @@ exports.searchUsers = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error searching users',
-      error: error.message 
     });
   }
 };
@@ -716,45 +696,60 @@ exports.getUserDashboard = async (req, res) => {
       });
     }
 
-    // Get user stories with proper filtering
-    const userStories = await Story.find({ 
-      $or: [
-        { author: userId },
-        { authorUsername: userUsername }
-      ],
-      $and: [
+    const storyFilter = buildUserStoryFilter(userId, userUsername);
+
+    // Counters aggregated in MongoDB, and only the 5 most recent stories are
+    // fetched. This previously loaded every story the user had written (full
+    // `content` on each) and did the arithmetic, sort and slice in Node.
+    const [aggResult, recentDocs] = await Promise.all([
+      Story.aggregate([
+        { $match: storyFilter },
         {
-          $or: [
-            { type: { $exists: false } },
-            { type: 'story' },
-            { type: 'fail_story' }
-          ]
+          $group: {
+            _id: null,
+            totalStories: { $sum: 1 },
+            publishedStories: { $sum: { $cond: [{ $eq: ['$status', 'published'] }, 1, 0] } },
+            draftStories: { $sum: { $cond: [{ $eq: ['$status', 'draft'] }, 1, 0] } },
+            totalViews: {
+              $sum: { $ifNull: ['$views', { $ifNull: ['$stats.views', 0] }] },
+            },
+            totalLikes: { $sum: { $size: { $ifNull: ['$likes', []] } } },
+            totalComments: { $sum: { $size: { $ifNull: ['$comments', []] } } },
+          },
         },
-        { category: { $ne: 'impact' } }
-      ]
-    }).lean();
+      ]),
+      Story.find(storyFilter)
+        .sort({ createdAt: -1 })
+        .limit(5)
+        // Only the first 120 characters of content are needed for the excerpt.
+        .select({
+          title: 1, status: 1, views: 1, 'stats.views': 1, likes: 1,
+          'stats.likes': 1, comments: 1, 'stats.comments': 1,
+          createdAt: 1, category: 1,
+          content: { $substrCP: [{ $ifNull: ['$content', ''] }, 0, 120] },
+        })
+        .lean(),
+    ]);
 
-    const totalStories = userStories.length;
-    const publishedStories = userStories.filter(s => s.status === 'published').length;
-    const draftStories = userStories.filter(s => s.status === 'draft').length;
-    const totalViews = userStories.reduce((sum, s) => sum + (s.views || s.stats?.views || 0), 0);
-    const totalLikes = userStories.reduce((sum, s) => sum + (s.likes?.length || s.stats?.likes || 0), 0);
-    const totalComments = userStories.reduce((sum, s) => sum + (s.comments?.length || s.stats?.comments || 0), 0);
+    const agg = aggResult[0] || {};
+    const totalStories = agg.totalStories || 0;
+    const publishedStories = agg.publishedStories || 0;
+    const draftStories = agg.draftStories || 0;
+    const totalViews = agg.totalViews || 0;
+    const totalLikes = agg.totalLikes || 0;
+    const totalComments = agg.totalComments || 0;
 
-    const recentStories = userStories
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-      .slice(0, 5)
-      .map(story => ({
-        id: story._id.toString(),
-        title: story.title,
-        status: story.status,
-        views: story.views || story.stats?.views || 0,
-        likes: story.likes?.length || story.stats?.likes || 0,
-        comments: story.comments?.length || story.stats?.comments || 0,
-        createdAt: story.createdAt,
-        category: story.category,
-        excerpt: story.content ? story.content.substring(0, 100) + '...' : ''
-      }));
+    const recentStories = recentDocs.map(story => ({
+      id: story._id.toString(),
+      title: story.title,
+      status: story.status,
+      views: story.views || story.stats?.views || 0,
+      likes: story.likes?.length || story.stats?.likes || 0,
+      comments: story.comments?.length || story.stats?.comments || 0,
+      createdAt: story.createdAt,
+      category: story.category,
+      excerpt: story.content ? story.content.substring(0, 100) + '...' : ''
+    }));
 
     const recentFollowers = (user.followers || [])
       .slice(-5)
@@ -825,7 +820,6 @@ exports.getUserDashboard = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching dashboard data',
-      error: error.message
     });
   }
 };
@@ -874,7 +868,6 @@ exports.getSuggestedUsers = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching suggested users',
-      error: err.message
     });
   }
 };
@@ -890,31 +883,34 @@ exports.getUserStats = async (req, res) => {
       .select('stats followers following profileViews')
       .lean();
 
-    // Get story statistics
-    const stories = await Story.find({
-      $or: [
-        { author: userId },
-        { authorUsername: userUsername }
-      ],
-      $and: [
-        {
-          $or: [
-            { type: { $exists: false } },
-            { type: 'story' },
-            { type: 'fail_story' }
-          ]
+    // Aggregate the counters in MongoDB. This previously loaded every story the
+    // user has ever written — full `content` included — just to run reduce().
+    const [agg] = await Story.aggregate([
+      { $match: buildUserStoryFilter(userId, userUsername) },
+      {
+        $group: {
+          _id: null,
+          storiesCount: { $sum: 1 },
+          publishedStories: { $sum: { $cond: [{ $eq: ['$status', 'published'] }, 1, 0] } },
+          draftStories: { $sum: { $cond: [{ $eq: ['$status', 'draft'] }, 1, 0] } },
+          // BEHAVIOUR FIX: this summed a top-level `views` field that does not
+          // exist on the Story schema (views live at `stats.views`), so
+          // /api/users/me/stats always reported totalViews: 0 while
+          // /api/users/dashboard reported the real figure. Now consistent.
+          totalViews: { $sum: { $ifNull: ['$views', { $ifNull: ['$stats.views', 0] }] } },
+          totalLikes: { $sum: { $size: { $ifNull: ['$likes', []] } } },
+          totalComments: { $sum: { $size: { $ifNull: ['$comments', []] } } },
         },
-        { category: { $ne: 'impact' } }
-      ]
-    }).lean();
+      },
+    ]);
 
     const stats = {
-      storiesCount: stories.length,
-      publishedStories: stories.filter(s => s.status === 'published').length,
-      draftStories: stories.filter(s => s.status === 'draft').length,
-      totalViews: stories.reduce((sum, s) => sum + (s.views || 0), 0),
-      totalLikes: stories.reduce((sum, s) => sum + (s.likes?.length || 0), 0),
-      totalComments: stories.reduce((sum, s) => sum + (s.comments?.length || 0), 0),
+      storiesCount: agg?.storiesCount || 0,
+      publishedStories: agg?.publishedStories || 0,
+      draftStories: agg?.draftStories || 0,
+      totalViews: agg?.totalViews || 0,
+      totalLikes: agg?.totalLikes || 0,
+      totalComments: agg?.totalComments || 0,
       followersCount: user.followers?.length || user.stats?.followersCount || 0,
       followingCount: user.following?.length || user.stats?.followingCount || 0,
       profileViews: user.profileViews || user.stats?.profileViews || 0
@@ -929,7 +925,6 @@ exports.getUserStats = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching user stats',
-      error: err.message
     });
   }
 };
@@ -958,14 +953,21 @@ exports.getUserStories = async (req, res) => {
       ]
     };
 
-    if (status !== 'all') {
-      query.status = status;
+    // `?status[$ne]=x` used to become a MongoDB operator; `?sort=<anything>`
+    // used to become an arbitrary sort key.
+    const statusFilter = asEnum(status, VALID_STORY_STATUSES);
+    if (statusFilter) {
+      query.status = statusFilter;
     }
 
+    const pageNum = asBoundedInt(page, { min: 1, max: 10000, fallback: 1 });
+    const limitNum = asBoundedInt(limit, { min: 1, max: 50, fallback: 10 });
+    const sortField = asEnum(sort, VALID_USER_STORY_SORTS, 'createdAt');
+
     const stories = await Story.find(query)
-      .sort({ [sort]: -1 })
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit))
+      .sort({ [sortField]: -1 })
+      .limit(limitNum)
+      .skip((pageNum - 1) * limitNum)
       .lean();
 
     const totalStories = await Story.countDocuments(query);
@@ -982,11 +984,11 @@ exports.getUserStories = async (req, res) => {
       success: true, 
       stories: enhancedStories,
       pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(totalStories / parseInt(limit)),
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalStories / limitNum),
         totalStories,
-        hasNext: page * limit < totalStories,
-        hasPrev: page > 1
+        hasNext: pageNum * limitNum < totalStories,
+        hasPrev: pageNum > 1
       }
     });
   } catch (err) {
@@ -994,7 +996,6 @@ exports.getUserStories = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching user stories',
-      error: err.message
     });
   }
 };
@@ -1005,26 +1006,37 @@ exports.getUserFollowers = async (req, res) => {
     const { username } = req.params;
     const { page = 1, limit = 20 } = req.query;
 
-    const user = await User.findOne({
+    const pageNum = asBoundedInt(page, { min: 1, max: 10000, fallback: 1 });
+    const limitNum = asBoundedInt(limit, { min: 1, max: 50, fallback: 20 });
+
+    // Two reads on purpose. `populate` with a limit truncates the array, so the
+    // previous code's `user.followers.length` could never exceed the page size —
+    // totalPages was always 1. Read the true count from the unpopulated doc.
+    const counts = await User.findOne({
       $or: [{ username }, { name: username }]
     })
-      .populate({
-        path: 'followers',
-        select: 'name username bio avatar stats createdAt',
-        options: {
-          limit: parseInt(limit),
-          skip: (parseInt(page) - 1) * parseInt(limit),
-          sort: { createdAt: -1 }
-        }
-      })
+      .select('followers')
       .lean();
 
-    if (!user) {
+    if (!counts) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
+    const totalFollowers = (counts.followers || []).length;
+
+    const user = await User.findById(counts._id)
+      .populate({
+        path: 'followers',
+        select: 'name username bio avatar stats createdAt',
+        options: {
+          limit: limitNum,
+          skip: (pageNum - 1) * limitNum,
+          sort: { createdAt: -1 }
+        }
+      })
+      .lean();
 
     const followers = (user.followers || []).map(follower => ({
       ...follower,
@@ -1033,17 +1045,15 @@ exports.getUserFollowers = async (req, res) => {
       followingCount: follower.stats?.followingCount || 0
     }));
 
-    const totalFollowers = user.followers?.length || 0;
-
     res.json({ 
       success: true, 
       followers,
       pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(totalFollowers / parseInt(limit)),
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalFollowers / limitNum),
         total: totalFollowers,
-        hasNext: page * limit < totalFollowers,
-        hasPrev: page > 1
+        hasNext: pageNum * limitNum < totalFollowers,
+        hasPrev: pageNum > 1
       }
     });
   } catch (err) {
@@ -1051,7 +1061,6 @@ exports.getUserFollowers = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching followers',
-      error: err.message
     });
   }
 };
@@ -1062,26 +1071,37 @@ exports.getUserFollowing = async (req, res) => {
     const { username } = req.params;
     const { page = 1, limit = 20 } = req.query;
 
-    const user = await User.findOne({
+    const pageNum = asBoundedInt(page, { min: 1, max: 10000, fallback: 1 });
+    const limitNum = asBoundedInt(limit, { min: 1, max: 50, fallback: 20 });
+
+    // Two reads on purpose. `populate` with a limit truncates the array, so the
+    // previous code's `user.following.length` could never exceed the page size —
+    // totalPages was always 1. Read the true count from the unpopulated doc.
+    const counts = await User.findOne({
       $or: [{ username }, { name: username }]
     })
-      .populate({
-        path: 'following',
-        select: 'name username bio avatar stats createdAt',
-        options: {
-          limit: parseInt(limit),
-          skip: (parseInt(page) - 1) * parseInt(limit),
-          sort: { createdAt: -1 }
-        }
-      })
+      .select('following')
       .lean();
 
-    if (!user) {
+    if (!counts) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
+    const totalFollowing = (counts.following || []).length;
+
+    const user = await User.findById(counts._id)
+      .populate({
+        path: 'following',
+        select: 'name username bio avatar stats createdAt',
+        options: {
+          limit: limitNum,
+          skip: (pageNum - 1) * limitNum,
+          sort: { createdAt: -1 }
+        }
+      })
+      .lean();
 
     const following = (user.following || []).map(followedUser => ({
       ...followedUser,
@@ -1090,17 +1110,15 @@ exports.getUserFollowing = async (req, res) => {
       followingCount: followedUser.stats?.followingCount || 0
     }));
 
-    const totalFollowing = user.following?.length || 0;
-
     res.json({ 
       success: true, 
       following,
       pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(totalFollowing / parseInt(limit)),
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalFollowing / limitNum),
         total: totalFollowing,
-        hasNext: page * limit < totalFollowing,
-        hasPrev: page > 1
+        hasNext: pageNum * limitNum < totalFollowing,
+        hasPrev: pageNum > 1
       }
     });
   } catch (err) {
@@ -1108,7 +1126,6 @@ exports.getUserFollowing = async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Error fetching following',
-      error: err.message
     });
   }
 };
@@ -1178,9 +1195,30 @@ exports.getUserProfile = async (req, res) => {
   }
 };
 
-exports.updateUserProfile = async (req, res) => {
+exports.updateUserProfile = async (req, res, next) => {
   try {
-    const updates = req.body;
+    // SECURITY: never $set req.body directly. Doing so let any authenticated
+    // user write `role: 'admin'`, or write `password` (which bypasses the
+    // bcrypt pre-save hook and stores cleartext), or forge followers/stats.
+    const { updates, rejected } = buildAllowedUpdate(req.body, PROFILE_UPDATE_SPEC);
+
+    if (rejected.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Request contains fields that cannot be updated here',
+        code: 'FORBIDDEN_FIELDS',
+        fields: summariseRejected(rejected),
+      });
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No updatable fields supplied',
+        code: 'EMPTY_UPDATE',
+      });
+    }
+
     const user = await User.findByIdAndUpdate(
       req.user._id,
       { $set: updates },
@@ -1193,11 +1231,7 @@ exports.updateUserProfile = async (req, res) => {
       profile: user
     });
   } catch (err) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error updating profile',
-      error: err.message
-    });
+    next(err);
   }
 };
 

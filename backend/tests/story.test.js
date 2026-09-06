@@ -101,8 +101,8 @@ describe('📖 Story Tests', () => {
       readerId = readerLoginRes.body.user.id;
 
       console.log('✅ Test users created and logged in');
-      console.log('Author token:', authorToken.substring(0, 20) + '...');
-      console.log('Reader token:', readerToken.substring(0, 20) + '...');
+
+
 
     } catch (error) {
       console.error('❌ Setup error:', error);

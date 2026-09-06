@@ -22,30 +22,39 @@ const {
 } = require('../controllers/userController');
 
 const { auth, optionalAuth } = require('../middleware/auth');
+const { writeLimiter, searchLimiter } = require('../middleware/rateLimit');
+const {
+  validateProfileUpdate,
+  validateUsernameParam,
+  validateUserIdParam,
+  validatePagination,
+} = require('../middleware/validation');
 
-router.use((req, res, next) => {
-  console.log(`\n👥 USER ROUTE: ${req.method} ${req.originalUrl}`);
-  console.log('Route params:', req.params);
-  console.log('Route query:', req.query);
-  console.log('Route body:', req.body);
-  next();
-});
+// Per-request debug logging removed: it echoed req.body/req.query on every
+// call (noise in production, and a leak vector for anything sensitive a
+// future endpoint accepts). morgan in app.js covers access logging.
 
-router.post('/:username/follow', auth, followUser);
+// NOTE: the '/me/*' and '/dashboard' routes are declared before the
+// '/:username/*' patterns below so a user literally named "me" cannot shadow
+// them. Express matches in declaration order.
+
+router.post('/:username/follow', auth, writeLimiter, validateUsernameParam, followUser);
 router.get('/dashboard', auth, getUserDashboard);
-router.get('/suggested', auth, getSuggestedUsers);
-router.post('/profile/:userId/view', auth, trackProfileView);
-router.get('/profile/:username', optionalAuth, getUserProfileByUsername);
-router.get('/me/feed', auth, getUserFeed);
+router.get('/suggested', auth, searchLimiter, getSuggestedUsers);
+router.post('/profile/:userId/view', auth, writeLimiter, validateUserIdParam, trackProfileView);
+router.get('/profile/:username', validateUsernameParam, optionalAuth, getUserProfileByUsername);
+router.get('/me/feed', auth, validatePagination, getUserFeed);
 router.get('/me/stats', auth, getUserStats);
-router.get('/me/stories', auth, getUserStories);
+router.get('/me/stories', auth, validatePagination, getUserStories);
 router.get('/me/analytics', auth, getUserAnalytics);
 router.get('/me/liked', auth, getLikedStories);
 router.get('/me/activity', auth, getUserActivity);
 router.get('/me/profile', auth, getUserProfile);
-router.put('/me/profile', auth, updateUserProfile);
-router.get('/:username/followers', optionalAuth, getUserFollowers);
-router.get('/:username/following', optionalAuth, getUserFollowing);
+// Field allowlist is enforced in the controller (utils/allowedUpdates.js);
+// validateProfileUpdate additionally type/length-checks the allowed fields.
+router.put('/me/profile', auth, writeLimiter, validateProfileUpdate, updateUserProfile);
+router.get('/:username/followers', validateUsernameParam, validatePagination, optionalAuth, getUserFollowers);
+router.get('/:username/following', validateUsernameParam, validatePagination, optionalAuth, getUserFollowing);
 router.get('/me/trends', auth, getViewTrends);
 router.get('/me/engagement', auth, getEngagementMetrics);
 

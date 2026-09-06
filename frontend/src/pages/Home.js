@@ -987,6 +987,8 @@ function Home() {
                   placeholder="Search inspiring stories..."
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
+                  // Matches the API's 100-character search limit.
+                  inputProps={{ maxLength: 100 }}
                   InputProps={{
                     startAdornment: (
                       <InputAdornment position="start">

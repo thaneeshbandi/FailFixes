@@ -1,143 +1,105 @@
-const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const {
+  verifyAuthToken,
+  extractBearerToken,
+  checkAccountState,
+} = require('../utils/token');
+
+// NOTE ON LOGGING: this middleware previously logged the token length, whether
+// JWT_SECRET was configured, the decoded user id and the authenticated user's
+// name/username on *every* request. That is both noisy and a slow leak of
+// session and identity data into the log stream. Only genuine failures are
+// logged now, and never the token itself.
 
 // ✅ MAIN AUTH MIDDLEWARE (REQUIRED)
 const protect = async (req, res, next) => {
-  console.log('\n🔐 AUTH MIDDLEWARE');
-  
   try {
-    const authHeader = req.header('Authorization');
-    console.log('Auth header present:', !!authHeader);
-    
-    if (!authHeader) {
-      console.error('❌ No Authorization header found');
-      return res.status(401).json({ 
-        success: false, 
+    const token = extractBearerToken(req.header('Authorization'));
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
         message: 'No token provided. Please login.',
-        code: 'NO_TOKEN'
+        code: 'NO_TOKEN',
       });
     }
 
-    // Extract token
-    const token = authHeader.startsWith('Bearer ') 
-      ? authHeader.slice(7) 
-      : authHeader;
-
-    if (!token || token === 'null' || token === 'undefined') {
-      console.error('❌ Invalid token in Authorization header');
-      return res.status(401).json({ 
-        success: false, 
-        message: 'Invalid token format. Please login again.',
-        code: 'INVALID_TOKEN_FORMAT'
-      });
-    }
-
-    console.log('✅ Token found, length:', token.length);
-    console.log('🔑 JWT_SECRET configured:', !!process.env.JWT_SECRET);
-
-    // Verify token
     let decoded;
     try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-      console.log('✅ Token verified, user ID:', decoded.id);
+      decoded = verifyAuthToken(token);
     } catch (jwtError) {
-      console.error('❌ JWT verification failed:', jwtError.message);
-      
-      if (jwtError.name === 'JsonWebTokenError') {
-        return res.status(401).json({ 
-          success: false, 
-          message: 'Invalid token. Please login again.',
-          code: 'INVALID_TOKEN',
-          hint: 'Token signature is invalid. You may need to login again.'
+      if (jwtError.name === 'TokenExpiredError') {
+        return res.status(401).json({
+          success: false,
+          message: 'Token expired. Please login again.',
+          code: 'TOKEN_EXPIRED',
         });
       }
-      
-      if (jwtError.name === 'TokenExpiredError') {
-        return res.status(401).json({ 
-          success: false, 
-          message: 'Token expired. Please login again.',
-          code: 'TOKEN_EXPIRED'
+
+      if (jwtError.name === 'JsonWebTokenError' || jwtError.name === 'NotBeforeError') {
+        return res.status(401).json({
+          success: false,
+          message: 'Invalid token. Please login again.',
+          code: 'INVALID_TOKEN',
         });
       }
 
       throw jwtError;
     }
 
-    // Find user
     const user = await User.findById(decoded.id).select('-password');
-    
-    if (!user) {
-      console.error('❌ User not found for token:', decoded.id);
-      return res.status(401).json({ 
-        success: false, 
-        message: 'User account not found. Please login again.',
-        code: 'USER_NOT_FOUND'
+
+    // Covers: deleted account, deactivated account, and revoked sessions
+    // (tokenVersion bump). Because this runs on every request, revocation and
+    // deactivation take effect immediately rather than at token expiry.
+    const state = checkAccountState(user, decoded);
+    if (!state.ok) {
+      return res.status(state.status).json({
+        success: false,
+        message: state.message,
+        code: state.code,
       });
     }
-
-    console.log('✅ User authenticated:', {
-      id: user._id.toString(),
-      name: user.name,
-      username: user.username
-    });
 
     req.user = user;
     next();
   } catch (error) {
     console.error('❌ Auth middleware error:', error.message);
-    console.error('Stack:', error.stack);
-    
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       message: 'Authentication error. Please try again.',
-      code: 'AUTH_ERROR'
+      code: 'AUTH_ERROR',
     });
   }
 };
 
 // ✅ OPTIONAL AUTH MIDDLEWARE (doesn't fail if no token)
+// Used by public endpoints that enrich their response when a caller happens to
+// be logged in (isLiked / isFollowing). A bad token is simply ignored.
 const optionalAuth = async (req, res, next) => {
-  console.log('\n🔓 OPTIONAL AUTH MIDDLEWARE');
-  
   try {
-    const authHeader = req.header('Authorization');
-    
-    if (!authHeader) {
-      console.log('No auth header - proceeding without authentication');
-      return next();
-    }
+    const token = extractBearerToken(req.header('Authorization'));
+    if (!token) return next();
 
-    const token = authHeader.startsWith('Bearer ') 
-      ? authHeader.slice(7) 
-      : authHeader;
-
-    if (!token || token === 'null' || token === 'undefined') {
-      console.log('No valid token - proceeding without authentication');
-      return next();
-    }
-
-    // Try to verify token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = verifyAuthToken(token);
     const user = await User.findById(decoded.id).select('-password');
-    
-    if (user) {
-      console.log('✅ Optional auth successful:', user.name);
+
+    // Same account-state rules as `protect`: a deactivated or revoked session
+    // must not receive personalised data either.
+    if (checkAccountState(user, decoded).ok) {
       req.user = user;
-    } else {
-      console.log('⚠️ Token valid but user not found');
     }
 
     next();
   } catch (error) {
-    console.log('⚠️ Optional auth failed - proceeding without auth:', error.message);
-    // Don't fail, just proceed without user
+    // Don't fail, just proceed without user.
     next();
   }
 };
 
 // ✅ Export both names for compatibility
-module.exports = { 
+module.exports = {
   auth: protect,
   protect,
-  optionalAuth 
+  optionalAuth,
 };

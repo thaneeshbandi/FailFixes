@@ -1,15 +1,14 @@
 require('dotenv').config();
-console.log("ENV CHECK:", process.env.MONGODB_URI);
 // server.js
 // Load environment variables from .env
 
 
-const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const jwt = require('jsonwebtoken');
 const app = require('./app');
 const { connectDB } = require('./utils/database');
+const { initSocket } = require('./socket');
+const { getAllowedOrigins } = require('./config/cors');
 const config = require('./config/config');
 
 // 🔎 Resend status on startup (no direct SDK import here)
@@ -17,10 +16,6 @@ console.log('📧 EMAIL PROVIDER STATUS:', {
   usingResend: !!process.env.RESEND_API_KEY,
   resendFrom: process.env.RESEND_FROM_EMAIL || 'not set',
 });
-
-// Import models for Socket.IO
-const User = require('./models/User');
-const Chat = require('./models/Chat');
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
@@ -40,169 +35,30 @@ const startServer = async () => {
     // Create HTTP server from Express app
     const server = http.createServer(app);
 
-    // CORS for Render deployment (Socket.IO)
-    const allowedOrigins = [
-      'http://localhost:3000',
-      'http://127.0.0.1:3000',
-      'http://localhost:3001',
-      'https://failfixes-frontend.onrender.com',
-      process.env.FRONTEND_URL,
-    ].filter(Boolean);
-
-    // SETUP SOCKET.IO SERVER with Render support
+    // SETUP SOCKET.IO SERVER
     const io = socketIo(server, {
       cors: {
-        origin: allowedOrigins,
-        methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+        // Same allowlist as the REST API (config/cors.js) — these two lists had
+        // drifted, leaving the Vercel production origin unable to open a socket.
+        origin: getAllowedOrigins(),
+        methods: ['GET', 'POST'],
         credentials: true,
         allowedHeaders: ['Content-Type', 'Authorization'],
       },
       transports: ['websocket', 'polling'], // Important for Render
-      allowEIO3: true,
+      // Chat messages are capped at 1000 characters; the 1MB default just gives
+      // an attacker a cheap way to push large frames at the server.
+      maxHttpBufferSize: 64 * 1024,
+      // Engine.IO v3 compatibility is only needed for socket.io-client v2.
+      // This app pins socket.io-client ^4, so the older protocol is off.
+      allowEIO3: false,
     });
 
-    // SOCKET.IO AUTHENTICATION MIDDLEWARE
-    io.use(async (socket, next) => {
-      try {
-        const token = socket.handshake.auth.token;
-        if (!token) {
-          return next(new Error('Authentication error'));
-        }
-
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.id);
-
-        if (!user) {
-          return next(new Error('User not found'));
-        }
-
-        socket.userId = user._id.toString();
-        socket.username = user.username || user.name;
-        socket.userInfo = {
-          id: user._id,
-          name: user.name,
-          username: user.username,
-          avatar: user.avatar,
-        };
-
-        next();
-      } catch (err) {
-        console.error('Socket auth error:', err);
-        next(new Error('Authentication error'));
-      }
-    });
-
-    // Active users tracking
-    const activeUsers = new Map();
-
-    // SOCKET.IO CONNECTION HANDLING
-    io.on('connection', (socket) => {
-      console.log(`🔌 User connected: ${socket.username} (${socket.userId})`);
-
-      // Add user to active users
-      activeUsers.set(socket.userId, {
-        socketId: socket.id,
-        userInfo: socket.userInfo,
-        lastSeen: new Date(),
-      });
-
-      // Join user to their personal room
-      socket.join(`user_${socket.userId}`);
-
-      // Broadcast user online status
-      socket.broadcast.emit('userOnline', {
-        userId: socket.userId,
-        userInfo: socket.userInfo,
-      });
-
-      // Join user's existing chats
-      socket.on('joinChats', async (chatIds) => {
-        for (const chatId of chatIds) {
-          socket.join(`chat_${chatId}`);
-        }
-      });
-
-      // Handle joining a specific chat
-      socket.on('joinChat', (chatId) => {
-        socket.join(`chat_${chatId}`);
-        console.log(`💬 ${socket.username} joined chat: ${chatId}`);
-      });
-
-      // Handle leaving a chat
-      socket.on('leaveChat', (chatId) => {
-        socket.leave(`chat_${chatId}`);
-      });
-
-      // Handle sending messages
-      socket.on('sendMessage', async (data) => {
-        try {
-          const { chatId, content, messageType = 'text' } = data;
-
-          const chat = await Chat.findById(chatId);
-          if (!chat) {
-            socket.emit('error', { message: 'Chat not found' });
-            return;
-          }
-
-          if (!chat.participants.includes(socket.userId)) {
-            socket.emit('error', {
-              message: 'Not authorized to send messages',
-            });
-            return;
-          }
-
-          const newMessage = {
-            sender: socket.userId,
-            content: content.trim(),
-            messageType,
-          };
-
-          chat.messages.push(newMessage);
-
-          chat.lastMessage = {
-            content: content.trim(),
-            sender: socket.userId,
-            timestamp: new Date(),
-          };
-
-          await chat.save();
-          await chat.populate('messages.sender', 'name username avatar');
-
-          const savedMessage = chat.messages[chat.messages.length - 1];
-
-          io.to(`chat_${chatId}`).emit('newMessage', {
-            chatId,
-            message: savedMessage,
-            chat: {
-              _id: chat._id,
-              lastMessage: chat.lastMessage,
-            },
-          });
-        } catch (error) {
-          console.error('Send message error:', error);
-          socket.emit('error', { message: 'Failed to send message' });
-        }
-      });
-
-      // Handle typing indicators
-      socket.on('typing', (data) => {
-        const { chatId, isTyping } = data;
-        socket.to(`chat_${chatId}`).emit('userTyping', {
-          userId: socket.userId,
-          username: socket.username,
-          isTyping,
-        });
-      });
-
-      // Handle disconnection
-      socket.on('disconnect', () => {
-        console.log(`🔌 User disconnected: ${socket.username}`);
-        activeUsers.delete(socket.userId);
-        socket.broadcast.emit('userOffline', {
-          userId: socket.userId,
-        });
-      });
-    });
+    // SOCKET.IO AUTH + HANDLERS
+    // Implemented in ./socket. That module reuses utils/token.js for handshake
+    // verification (algorithm pin + isActive + tokenVersion) and authorizes
+    // every room join against chat participation.
+    initSocket(io);
 
     // Make io accessible to routes
     app.set('io', io);
@@ -245,12 +101,12 @@ const startServer = async () => {
 💡 Tips:
    • Frontend URL: ${process.env.FRONTEND_URL || 'Not set'}
    • Socket.IO endpoint: http://localhost:${PORT}/socket.io/
-   • Allowed origins: ${allowedOrigins.length} configured
+   • Allowed origins: ${getAllowedOrigins().length} configured
       `);
     });
 
     // Handle unhandled promise rejections
-    process.on('unhandledRejection', (err, promise) => {
+    process.on('unhandledRejection', (err) => {
       console.error('💥 UNHANDLED REJECTION! Shutting down...');
       console.error('Error name:', err.name);
       console.error('Error message:', err.message);

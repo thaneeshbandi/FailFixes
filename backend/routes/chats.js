@@ -1,33 +1,66 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const Chat = require('../models/Chat');
 const User = require('../models/User');
 const { auth } = require('../middleware/auth');
+const { writeLimiter } = require('../middleware/rateLimit');
+const {
+  validateChatIdParam,
+  validatePagination,
+} = require('../middleware/validation');
 
 // Get all chats for current user
 router.get('/', auth, async (req, res) => {
   try {
     const userId = req.user._id;
     
-    const chats = await Chat.find({
-      participants: userId
-    })
-    .populate('participants', 'name username avatar')
-    .populate('lastMessage.sender', 'name username')
-    .sort({ updatedAt: -1 })
-    .lean();
+    // The unread count used to be computed by pulling EVERY message of EVERY
+    // chat into Node. Count them in MongoDB and never ship the message bodies.
+    const chats = await Chat.aggregate([
+      { $match: { participants: userId } },
+      { $sort: { updatedAt: -1 } },
+      {
+        $addFields: {
+          unreadCount: {
+            $size: {
+              $filter: {
+                input: { $ifNull: ['$messages', []] },
+                as: 'm',
+                cond: {
+                  $and: [
+                    { $ne: ['$$m.sender', userId] },
+                    {
+                      $not: {
+                        $in: [
+                          userId,
+                          {
+                            $map: {
+                              input: { $ifNull: ['$$m.readBy', []] },
+                              as: 'r',
+                              in: '$$r.user',
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+      // Drop the message array from the payload — the list view never renders it.
+      { $project: { messages: 0 } },
+    ]);
 
-    const chatsWithUnread = chats.map(chat => {
-      const unreadCount = chat.messages.filter(message => 
-        message.sender.toString() !== userId.toString() &&
-        !message.readBy.some(read => read.user.toString() === userId.toString())
-      ).length;
+    await Chat.populate(chats, [
+      { path: 'participants', select: 'name username avatar' },
+      { path: 'lastMessage.sender', select: 'name username' },
+    ]);
 
-      return {
-        ...chat,
-        unreadCount
-      };
-    });
+    const chatsWithUnread = chats;
 
     res.json({
       success: true,
@@ -40,7 +73,7 @@ router.get('/', auth, async (req, res) => {
 });
 
 // Create or get existing direct chat
-router.post('/direct', auth, async (req, res) => {
+router.post('/direct', auth, writeLimiter, async (req, res) => {
   try {
     const { userId: targetUserId } = req.body;
     const currentUserId = req.user._id;
@@ -89,26 +122,53 @@ router.post('/direct', auth, async (req, res) => {
 });
 
 // Get chat messages
-router.get('/:chatId/messages', auth, async (req, res) => {
+router.get('/:chatId/messages', auth, validateChatIdParam, validatePagination, async (req, res) => {
   try {
     const { chatId } = req.params;
     const { page = 1, limit = 50 } = req.query;
     const userId = req.user._id;
 
-    const chat = await Chat.findById(chatId);
-    if (!chat) {
+    // Authorization first, on a projection that does NOT pull the messages.
+    const chatMeta = await Chat.findById(chatId).select('participants').lean();
+    if (!chatMeta) {
       return res.status(404).json({ success: false, message: 'Chat not found' });
     }
 
-    if (!chat.participants.includes(userId)) {
+    if (!chatMeta.participants.some((p) => p.toString() === userId.toString())) {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const messages = chat.messages
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-      .slice(skip, skip + parseInt(limit))
-      .reverse();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+    const skip = (pageNum - 1) * limitNum;
+
+    // Page inside MongoDB (newest-first window, returned oldest-first) instead
+    // of loading and sorting the entire embedded array in Node on every open.
+    const [doc] = await Chat.aggregate([
+      { $match: { _id: new mongoose.Types.ObjectId(chatId) } },
+      {
+        $project: {
+          totalMessages: { $size: { $ifNull: ['$messages', []] } },
+          messages: {
+            $slice: [
+              {
+                $reverseArray: {
+                  $sortArray: {
+                    input: { $ifNull: ['$messages', []] },
+                    sortBy: { createdAt: 1 },
+                  },
+                },
+              },
+              skip,
+              limitNum,
+            ],
+          },
+        },
+      },
+    ]);
+
+    const messages = (doc ? doc.messages : []).reverse();
+    const totalMessages = doc ? doc.totalMessages : 0;
 
     await Chat.populate(messages, {
       path: 'sender',
@@ -119,9 +179,9 @@ router.get('/:chatId/messages', auth, async (req, res) => {
       success: true,
       messages,
       pagination: {
-        currentPage: parseInt(page),
-        totalMessages: chat.messages.length,
-        hasNext: skip + parseInt(limit) < chat.messages.length
+        currentPage: pageNum,
+        totalMessages,
+        hasNext: skip + limitNum < totalMessages
       }
     });
   } catch (error) {

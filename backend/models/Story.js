@@ -145,6 +145,19 @@ const storySchema = new mongoose.Schema({
 });
 
 // 🎯 INDEXES FOR PERFORMANCE
+// Serves the default listing: { status: 'published' } sorted by createdAt desc.
+// Neither of the pre-existing compound indexes ({category,status} /
+// {status,moderationStatus}) covered it, so that query did a collection scan
+// plus an in-memory sort.
+storySchema.index({ status: 1, createdAt: -1 });
+// Same listing under ?sortBy=popular / ?sortBy=views.
+storySchema.index({ status: 1, 'stats.views': -1 });
+// `?sortBy=popular` sorts by { 'stats.likes': -1, 'stats.views': -1 }. A two-field
+// index only serves the `likes` prefix, leaving MongoDB to sort ties in memory —
+// measured at 1800 documents examined for a 9-document page on a 2000-doc set.
+// This three-field index serves the whole sort.
+storySchema.index({ status: 1, 'stats.likes': -1, 'stats.views': -1 });
+
 storySchema.index({ authorUsername: 1, createdAt: -1 });
 storySchema.index({ author: 1, createdAt: -1 });
 storySchema.index({ category: 1, status: 1 });
@@ -153,7 +166,9 @@ storySchema.index({ tags: 1 });
 storySchema.index({ 'stats.views': -1 });
 storySchema.index({ 'stats.likes': -1 });
 storySchema.index({ 'stats.comments': -1 });
-storySchema.index({ slug: 1 });
+// NOTE: no explicit slug/authorUsername index here — the field definitions above
+// already declare them (slug: unique+sparse). Declaring them twice produced an
+// IndexKeySpecsConflict that broke Model.init() and syncIndexes().
 storySchema.index({ publishedAt: -1 });
 storySchema.index({ featured: 1, 'stats.views': -1 });
 storySchema.index({ likes: 1 });

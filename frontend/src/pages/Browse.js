@@ -578,6 +578,8 @@ function Browse() {
                   placeholder="Search by story title..."
                   value={searchInput}
                   onChange={(e) => handleFilterChange('search', e.target.value)}
+                  // Matches the API's 100-character search limit.
+                  inputProps={{ maxLength: 100 }}
                   InputProps={{
                     startAdornment: (
                       <InputAdornment position="start">
