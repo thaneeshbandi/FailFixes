@@ -140,6 +140,15 @@ jobs:
         working-directory: ./frontend
         run: npm ci
 
+      # Frontend tests were never run here. src/App.test.js still contained
+      # Create React App's default "renders learn react link" test, which had
+      # always failed — nothing surfaced it because this job only built.
+      - name: Run frontend tests
+        working-directory: ./frontend
+        run: npm test -- --watchAll=false
+        env:
+          CI: true
+
       # NOTE ON `CI=false`: with CI=true, react-scripts promotes *lint warnings*
       # to build failures. This codebase has ~41 unused-import warnings that are
       # not defects. CI=false downgrades those warnings only — a genuine
@@ -194,3 +203,19 @@ jobs:
         # Reported but non-blocking: the remaining advisories are in the CRA
         # build toolchain, whose only fix is a framework migration.
         run: npm audit --omit=dev --audit-level=high || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPLOYMENT
+#
+# There is deliberately no deploy job in this workflow, and no deployment
+# manifest anywhere in this repository (no Dockerfile, no render.yaml, no
+# vercel.json). Both services are deployed by Render's own GitHub integration,
+# which watches this repository and builds on a push to `main`. That
+# configuration — build command, start command, environment variables, health
+# check path — lives in the Render dashboard and is not version-controlled here.
+#
+# This is a real limitation, recorded rather than papered over: the deployment is
+# not reproducible from the repository alone. Moving it into the repo (a
+# render.yaml, or a container image built and pushed by this workflow) is listed
+# under Future improvements in the README.
+# ─────────────────────────────────────────────────────────────────────────────

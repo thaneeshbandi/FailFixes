@@ -535,31 +535,69 @@ describe('👤 User Tests', () => {
       expect(res.body.success).toBe(true);
     });
 
-    test('GET /api/users/me/analytics should return placeholder', async () => {
-      const res = await request(app)
-        .get('/api/users/me/analytics')
-        .set('Authorization', `Bearer ${user1Token}`);
-
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
+    // The /me/analytics, /me/trends, /me/engagement and /me/activity endpoints
+    // were removed: all four returned hardcoded empty objects with no data model
+    // behind them. These tests assert they are gone, so nobody reintroduces a
+    // placeholder endpoint by accident.
+    test.each([
+      '/api/users/me/analytics',
+      '/api/users/me/trends',
+      '/api/users/me/engagement',
+      '/api/users/me/activity',
+    ])('%s is removed, not a placeholder', async (url) => {
+      const res = await request(app).get(url).set('Authorization', `Bearer ${user1Token}`);
+      expect(res.status).toBe(404);
     });
 
-    test('GET /api/users/me/trends should return placeholder', async () => {
+    test('GET /api/users/me/liked returns real liked stories, not an empty stub', async () => {
+      const story = await Story.create({
+        title: 'A story that will be liked by user one',
+        content: 'x'.repeat(150),
+        category: 'career',
+        author: user2Id,
+        authorUsername: 'testuser2',
+        status: 'published',
+      });
+
+      // Like it through the real endpoint so the User.likedStories side effect runs.
+      const likeRes = await request(app)
+        .patch(`/api/stories/${story._id}/like`)
+        .set('Authorization', `Bearer ${user1Token}`);
+      expect(likeRes.status).toBe(200);
+
       const res = await request(app)
-        .get('/api/users/me/trends')
+        .get('/api/users/me/liked')
         .set('Authorization', `Bearer ${user1Token}`);
 
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
+      expect(Array.isArray(res.body.stories)).toBe(true);
+      expect(res.body.stories.map((s) => s._id.toString())).toContain(story._id.toString());
+      expect(res.body.pagination.totalStories).toBeGreaterThan(0);
     });
 
-    test('GET /api/users/me/engagement should return placeholder', async () => {
+    test('GET /api/users/me/liked never returns an unpublished story', async () => {
+      const draft = await Story.create({
+        title: 'A draft that was liked before being unpublished',
+        content: 'y'.repeat(150),
+        category: 'career',
+        author: user2Id,
+        authorUsername: 'testuser2',
+        status: 'published',
+      });
+
+      await request(app)
+        .patch(`/api/stories/${draft._id}/like`)
+        .set('Authorization', `Bearer ${user1Token}`);
+
+      await Story.findByIdAndUpdate(draft._id, { $set: { status: 'draft' } });
+
       const res = await request(app)
-        .get('/api/users/me/engagement')
+        .get('/api/users/me/liked')
         .set('Authorization', `Bearer ${user1Token}`);
 
       expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
+      expect(res.body.stories.map((s) => s._id.toString())).not.toContain(draft._id.toString());
     });
   });
 });

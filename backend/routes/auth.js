@@ -5,11 +5,14 @@ const {
   signup,
   login,
   getMe,
+  logout,
+  changePassword,
 } = require('../controllers/authController');
 const { auth } = require('../middleware/auth');
 const {
   validateSignup,
   validateLogin,
+  validatePasswordChange,
 } = require('../middleware/validation');
 const { authLimiter } = require('../middleware/rateLimit');
 
@@ -29,6 +32,17 @@ router.post('/login', authLimiter, validateLogin, login);
 
 // GET /api/auth/me - Get current user info
 router.get('/me', auth, getMe);
+
+// POST /api/auth/logout - End the session by bumping tokenVersion.
+// This is what makes the tokenVersion check in utils/token.js reachable: before
+// this route existed the field was compared on every request but never changed,
+// so no token could ever actually be revoked.
+router.post('/logout', auth, logout);
+
+// PUT /api/auth/change-password - Change password and revoke other sessions.
+// authLimiter (not writeLimiter) because this endpoint verifies a credential
+// with bcrypt, so it belongs in the same abuse budget as login.
+router.put('/change-password', auth, authLimiter, validatePasswordChange, changePassword);
 
 // ⛔ verify-email route removed
 

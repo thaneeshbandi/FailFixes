@@ -14,9 +14,17 @@
  * is the real client address from X-Forwarded-For. Authenticated limiters key on
  * the user id instead, so one abusive account cannot be hidden behind rotating
  * IPs, and users behind a shared NAT don't throttle each other.
+ *
+ * Storage: counters live in Redis when REDIS_URL is set (see
+ * middleware/rateLimitStore.js), so a limit survives a restart and is shared
+ * across instances. Without Redis — or while Redis is unreachable — each process
+ * falls back to an in-memory store, which is weaker but never fails a request.
+ * Every limiter below shares ONE store instance so they cannot diverge; the
+ * per-limiter `prefix` keeps their key spaces separate.
  */
 
 const rateLimit = require('express-rate-limit');
+const { createRateLimitStore } = require('./rateLimitStore');
 
 const num = (value, fallback) => {
   const n = parseInt(value, 10);
@@ -37,14 +45,22 @@ function userOrIpKey(req) {
   return req.user ? `u:${req.user._id}` : `ip:${req.ip}`;
 }
 
-function build({ windowMs, max, message, code, keyGenerator }) {
+// One shared store for every limiter in this module. `undefined` means "use
+// express-rate-limit's own MemoryStore", which is what happens with no REDIS_URL.
+const sharedStore = createRateLimitStore();
+
+function build({ windowMs, max, message, code, keyGenerator, prefix }) {
   return rateLimit({
     windowMs,
     max,
     standardHeaders: true, // RateLimit-* headers
     legacyHeaders: false,
     skip: skipInTests,
-    keyGenerator: keyGenerator || ((req) => `ip:${req.ip}`),
+    store: sharedStore,
+    // Namespaced so two limiters with the same window never share a counter for
+    // the same client. Without this, `ip:1.2.3.4` in the auth limiter and in the
+    // view limiter would be the same Redis key.
+    keyGenerator: (req) => `${prefix}:${(keyGenerator || ((r) => `ip:${r.ip}`))(req)}`,
     handler: (req, res) => {
       res.status(429).json({
         success: false,
@@ -61,6 +77,7 @@ function build({ windowMs, max, message, code, keyGenerator }) {
  * endpoints and each login runs a cost-12 bcrypt comparison.
  */
 const authLimiter = build({
+  prefix: 'auth',
   windowMs: num(process.env.RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
   max: num(process.env.AUTH_RATE_LIMIT_MAX, 10),
   message: 'Too many authentication attempts. Please try again later.',
@@ -72,6 +89,7 @@ const authLimiter = build({
  * surface. Keyed per user (the route requires auth).
  */
 const aiLimiter = build({
+  prefix: 'ai',
   windowMs: num(process.env.AI_RATE_LIMIT_WINDOW_MS, 60 * 60 * 1000),
   max: num(process.env.AI_RATE_LIMIT_MAX, 20),
   message: 'AI generation limit reached. Please try again later.',
@@ -81,6 +99,7 @@ const aiLimiter = build({
 
 /** Authenticated writes: create/update/delete story, comment, follow. */
 const writeLimiter = build({
+  prefix: 'write',
   windowMs: num(process.env.WRITE_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
   max: num(process.env.WRITE_RATE_LIMIT_MAX, 100),
   message: 'Too many write requests. Please slow down.',
@@ -93,6 +112,7 @@ const writeLimiter = build({
  * but bounded, so view counts can't be inflated without limit.
  */
 const viewLimiter = build({
+  prefix: 'view',
   windowMs: num(process.env.VIEW_RATE_LIMIT_WINDOW_MS, 5 * 60 * 1000),
   max: num(process.env.VIEW_RATE_LIMIT_MAX, 120),
   message: 'Too many requests.',
@@ -104,6 +124,7 @@ const viewLimiter = build({
  * story document, so it gets its own budget.
  */
 const searchLimiter = build({
+  prefix: 'search',
   windowMs: num(process.env.SEARCH_RATE_LIMIT_WINDOW_MS, 5 * 60 * 1000),
   max: num(process.env.SEARCH_RATE_LIMIT_MAX, 100),
   message: 'Too many search requests. Please slow down.',
@@ -116,6 +137,7 @@ const searchLimiter = build({
  * flood, not to shape normal traffic.
  */
 const globalLimiter = build({
+  prefix: 'global',
   windowMs: num(process.env.RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
   max: num(process.env.RATE_LIMIT_MAX_REQUESTS, 1000),
   message: 'Too many requests. Please try again later.',
@@ -123,6 +145,7 @@ const globalLimiter = build({
 });
 
 module.exports = {
+  sharedStore,
   authLimiter,
   aiLimiter,
   writeLimiter,

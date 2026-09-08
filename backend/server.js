@@ -58,7 +58,11 @@ const startServer = async () => {
     // Implemented in ./socket. That module reuses utils/token.js for handshake
     // verification (algorithm pin + isActive + tokenVersion) and authorizes
     // every room join against chat participation.
-    initSocket(io);
+    //
+    // Async because it attaches the Redis adapter when REDIS_URL is set, which
+    // requires two connected Redis clients. Awaited before listen() so no socket
+    // can be accepted before the auth middleware and adapter are in place.
+    const socketRuntime = await initSocket(io);
 
     // Make io accessible to routes
     app.set('io', io);
@@ -78,7 +82,10 @@ const startServer = async () => {
 ║ 🕒 Started: ${new Date().toLocaleString().padEnd(38)} ║
 ║ 🚀 API URL: http://localhost:${PORT}/api${' '.repeat(25)} ║
 ║ 🏥 Health: http://localhost:${PORT}/api/health${' '.repeat(18)} ║
-║ 💬 Socket.IO: ENABLED${' '.repeat(33)} ║
+║ 💬 Socket.IO: ${(socketRuntime.presence.isShared()
+        ? 'ENABLED (Redis adapter)'
+        : 'ENABLED (single instance)'
+      ).padEnd(40)} ║
 ║ 📊 Database: ${
         config.database.uri.includes('mongodb.net')
           ? 'MongoDB Atlas'.padEnd(33)
@@ -122,6 +129,15 @@ const startServer = async () => {
 
       server.close(async () => {
         console.log('💤 HTTP server closed');
+
+        try {
+          // Release the Socket.IO adapter's pub/sub connections before Mongo, so
+          // a slow database close cannot leave Redis connections dangling.
+          await socketRuntime.close();
+          console.log('📤 Socket.IO Redis connections closed');
+        } catch (err) {
+          console.error('❌ Error closing Socket.IO Redis connections:', err);
+        }
 
         try {
           await require('mongoose').connection.close();

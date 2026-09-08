@@ -12,9 +12,13 @@
  * the conversation over REST.
  */
 
+const { createAdapter } = require('@socket.io/redis-adapter');
+const redis = require('redis');
+
 const User = require('../models/User');
 const Chat = require('../models/Chat');
 const { verifyAuthToken, checkAccountState } = require('../utils/token');
+const { createPresenceTracker } = require('./presence');
 const {
   createRateLimiter,
   EVENT_LIMITS,
@@ -72,10 +76,14 @@ async function socketAuthMiddleware(socket, next) {
 }
 
 /**
- * Register handlers for one connected socket.
- * `activeUsers` is the shared presence map owned by the caller.
+ * Register the message/room handlers for one connected socket.
+ *
+ * Presence and the connection cap are NOT handled here — they belong to
+ * initSocket, which owns the shared counter (socket/presence.js) and is the only
+ * place that can tell whether a connect/disconnect is the account's first or
+ * last across the whole cluster.
  */
-function registerSocketHandlers(io, socket, activeUsers) {
+function registerSocketHandlers(io, socket) {
   const deny = (message, code) => socket.emit('error', { message, ...(code ? { code } : {}) });
 
   /** @returns {boolean} true when the event is allowed to proceed */
@@ -92,19 +100,16 @@ function registerSocketHandlers(io, socket, activeUsers) {
     return true;
   };
 
-  activeUsers.set(socket.userId, {
-    socketId: socket.id,
-    userInfo: socket.userInfo,
-    lastSeen: new Date(),
-  });
-
   // Personal room, keyed by the authenticated id — a client cannot pick this.
   socket.join(`user_${socket.userId}`);
 
-  // Presence: broadcast the id only. The previous payload also shipped every
-  // user's name, username and avatar to every connected socket; the client only
+  // Presence is announced by initSocket, which owns the shared counter and knows
+  // whether this was the account's FIRST connection. Announcing here would fire
+  // once per tab.
+  //
+  // Note the payload is the id only: the original also shipped every user's
+  // name, username and avatar to every connected socket, and the client only
   // ever reads `userId`.
-  socket.broadcast.emit('userOnline', { userId: socket.userId });
 
   // ---- joinChats: bulk subscribe, authorized per chat ----
   socket.on('joinChats', async (chatIds) => {
@@ -241,15 +246,8 @@ function registerSocketHandlers(io, socket, activeUsers) {
     }
   });
 
-  socket.on('disconnect', () => {
-    // Only clear presence if this socket is still the registered one; a user
-    // with two tabs shouldn't appear offline when one of them closes.
-    const current = activeUsers.get(socket.userId);
-    if (current && current.socketId === socket.id) {
-      activeUsers.delete(socket.userId);
-      socket.broadcast.emit('userOffline', { userId: socket.userId });
-    }
-  });
+  // `disconnect` is handled in initSocket, which owns the shared counter: a user
+  // is offline only when their LAST connection closes, anywhere in the cluster.
 }
 
 /**
@@ -258,46 +256,170 @@ function registerSocketHandlers(io, socket, activeUsers) {
  * The per-event rate limiter lives on the socket, so without this an attacker
  * with one valid account could simply open N connections and multiply their
  * event budget by N. A real user needs only a handful (multiple tabs/devices).
+ *
+ * Enforced against the SHARED counter in socket/presence.js, so the cap is the
+ * cap for the whole cluster rather than per instance.
  */
 const MAX_SOCKETS_PER_USER = 8;
 
 /**
- * Attach authentication + handlers to an io instance.
- * @returns {Map} the presence map, for callers that want to inspect it
+ * Attach the Redis adapter when REDIS_URL is configured.
+ *
+ * Socket.IO keeps its room registry in the memory of the process that owns the
+ * connection, so `io.to('chat_x').emit(...)` reaches only locally-connected
+ * sockets. The adapter publishes each broadcast on Redis pub/sub and every other
+ * instance replays it to its own local members — which is what makes running
+ * more than one instance correct.
+ *
+ * The adapter needs TWO dedicated connections: a Redis connection in subscriber
+ * mode cannot issue ordinary commands, so the publisher must be separate. Neither
+ * may be the cache client from middleware/cache.js for the same reason.
+ *
+ * @returns {Promise<{pubClient: object, subClient: object}|null>} null when no
+ *          REDIS_URL is set, or when Redis could not be reached — in which case
+ *          the server keeps working as a correct single instance.
  */
-function initSocket(io) {
-  const activeUsers = new Map();
-  // userId -> number of open sockets
-  const connectionCounts = new Map();
+async function attachRedisAdapter(io) {
+  if (!process.env.REDIS_URL) {
+    console.log('ℹ️  Socket.IO: no REDIS_URL — running single-instance (in-memory adapter)');
+    return null;
+  }
+
+  try {
+    const pubClient = redis.createClient({ url: process.env.REDIS_URL });
+    const subClient = pubClient.duplicate();
+
+    // Without listeners, a later connection error would be an unhandled 'error'
+    // event and would crash the process.
+    pubClient.on('error', (err) => console.warn('⚠️  Socket.IO pub client error:', err.message));
+    subClient.on('error', (err) => console.warn('⚠️  Socket.IO sub client error:', err.message));
+
+    await Promise.all([pubClient.connect(), subClient.connect()]);
+    io.adapter(createAdapter(pubClient, subClient));
+
+    console.log('✅ Socket.IO: Redis adapter attached — multi-instance broadcasts enabled');
+    return { pubClient, subClient };
+  } catch (err) {
+    // A cache outage should not take chat down; it should reduce the deployment
+    // to one correct instance. This is only safe because the failure is loud.
+    console.error(
+      '❌ Socket.IO: Redis adapter unavailable (%s). Falling back to the in-memory ' +
+        'adapter — broadcasts will NOT cross instances. Run a single instance until ' +
+        'Redis is restored.',
+      err.message
+    );
+    return null;
+  }
+}
+
+/**
+ * Attach authentication + handlers to an io instance.
+ *
+ * @param {import('socket.io').Server} io
+ * @param {{redisClient?: object}} [deps] injection point for tests
+ * @returns {Promise<{presence: object, close: function}>}
+ */
+async function initSocket(io, deps = {}) {
+  const adapterClients = deps.skipAdapter ? null : await attachRedisAdapter(io);
+
+  // Set during shutdown. Once true, disconnect handlers stop broadcasting:
+  // the adapter publishes over Redis, and publishing on a closing client
+  // rejects asynchronously — which server.js treats as an unhandledRejection
+  // and responds to by exiting non-zero. A clean SIGTERM would look like a
+  // crash in the platform's logs.
+  let closing = false;
+
+  // The presence counter reuses the adapter's publisher connection when there is
+  // one: it issues ordinary commands (INCR/DECR/GET), which a publisher can do,
+  // and it saves a third connection per instance.
+  const presenceClient = deps.redisClient || (adapterClients && adapterClients.pubClient) || null;
+  const presence = createPresenceTracker(presenceClient, { maxPerUser: MAX_SOCKETS_PER_USER });
 
   io.use(socketAuthMiddleware);
 
-  io.use((socket, next) => {
-    const count = connectionCounts.get(socket.userId) || 0;
-    if (count >= MAX_SOCKETS_PER_USER) {
-      return next(new Error('Too many connections'));
+  // Connection cap, enforced against the shared counter. Reserving the slot in
+  // the middleware (rather than in the connection handler) means a refused
+  // socket never reaches the handlers at all.
+  io.use(async (socket, next) => {
+    try {
+      const slot = await presence.acquire(socket.userId);
+      if (!slot.allowed) {
+        return next(new Error('Too many connections'));
+      }
+      // Remembered so `disconnect` releases exactly one slot, and so the
+      // userOnline broadcast happens only for the account's first connection.
+      socket.data.presenceAcquired = true;
+      socket.data.isFirstConnection = slot.isFirst;
+      return next();
+    } catch (err) {
+      console.error('Socket presence error:', err.message);
+      return next(new Error('Connection rejected'));
     }
-    connectionCounts.set(socket.userId, count + 1);
-    next();
   });
 
   io.on('connection', (socket) => {
-    // Decrement on close, and delete the key at zero so this map cannot grow
-    // unbounded across the process lifetime.
-    socket.on('disconnect', () => {
-      const remaining = (connectionCounts.get(socket.userId) || 1) - 1;
-      if (remaining <= 0) connectionCounts.delete(socket.userId);
-      else connectionCounts.set(socket.userId, remaining);
-    });
+    registerSocketHandlers(io, socket, presence);
 
-    registerSocketHandlers(io, socket, activeUsers);
+    // Announce arrival only when this is the account's first live connection
+    // anywhere in the cluster. `socket.broadcast` is adapter-aware, so this
+    // reaches other instances too.
+    if (socket.data.isFirstConnection) {
+      socket.broadcast.emit('userOnline', { userId: socket.userId });
+    }
+
+    socket.on('disconnect', async () => {
+      if (!socket.data.presenceAcquired) return;
+      socket.data.presenceAcquired = false;
+
+      try {
+        const { isLast } = await presence.release(socket.userId);
+        if (isLast && !closing) {
+          socket.broadcast.emit('userOffline', { userId: socket.userId });
+        }
+      } catch (err) {
+        console.error('Socket presence release error:', err.message);
+      }
+    });
   });
 
-  return activeUsers;
+  return {
+    presence,
+
+    /**
+     * Shut the socket layer down in the only order that is safe.
+     *
+     * Sockets must be disconnected while the adapter's Redis connections are
+     * still open, because each disconnect decrements the shared presence
+     * counter. Quitting Redis first would leave every counter inflated, and
+     * those accounts would appear online until their key's TTL expired.
+     */
+    async close() {
+      closing = true;
+
+      try {
+        io.disconnectSockets(true);
+      } catch (err) {
+        console.warn('⚠️  Socket.IO: error disconnecting sockets:', err.message);
+      }
+
+      // Let the disconnect handlers' presence.release() calls reach Redis before
+      // the connections are torn down. They are fire-and-forget by nature (a
+      // disconnect handler has nothing to await it), so a short drain is the
+      // pragmatic way to give them a chance.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      if (!adapterClients) return;
+      await Promise.allSettled([
+        adapterClients.pubClient.quit(),
+        adapterClients.subClient.quit(),
+      ]);
+    },
+  };
 }
 
 module.exports = {
   initSocket,
+  attachRedisAdapter,
   MAX_SOCKETS_PER_USER,
   socketAuthMiddleware,
   registerSocketHandlers,

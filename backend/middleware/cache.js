@@ -201,7 +201,18 @@ async function quitRedis() {
   }
 }
 
+/**
+ * Test-only seam. The rate-limit store reads its client from this module, so a
+ * test needs a way to point it at a client it controls without booting the whole
+ * cache. Never called by application code.
+ */
+function __setClientForTests(client, connected) {
+  redisClient = client;
+  redisConnected = Boolean(connected);
+}
+
 module.exports = {
+  __setClientForTests,
   initRedis,
   cacheMiddleware,
   invalidateCache,

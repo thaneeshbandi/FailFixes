@@ -193,7 +193,10 @@ function StartChatDialog({ open, onClose, onChatCreated }) {
   const searchUsers = async () => {
     try {
       setLoading(true);
-      const response = await userAPI.searchUsers({ query: searchQuery });
+      // The backend reads `q` (see backend/controllers/userController.js
+      // searchUsers). This passed `query`, so even once the route existed the
+      // term was ignored and the endpoint answered with an empty list.
+      const response = await userAPI.searchUsers(searchQuery);
       if (response.data.success) {
         setUsers(response.data.users);
       }
@@ -604,51 +607,68 @@ function ChatWindow({ chat }) {
   const [loading, setLoading] = useState(false);
   const [typing, setTyping] = useState([]);
   const messagesEndRef = useRef(null);
-  const { socket } = useSocket();
+  const { socket, joinChat, leaveChat } = useSocket();
   const { user } = useAuth();
   const currentUserId = user?._id || user?.id;
 
   useEffect(() => {
-    if (chat && socket) {
-      fetchMessages();
-      socket.emit("joinChat", chat._id);
-      markChatAsRead();
-    }
+    if (!chat || !socket) return undefined;
+
+    fetchMessages();
+    // Through the context helpers so the room is tracked and re-joined after a
+    // reconnect, rather than emitted directly and forgotten.
+    joinChat(chat._id);
+    markChatAsRead();
+
     return () => {
-      if (chat && socket) {
-        socket.emit("leaveChat", chat._id);
-      }
+      leaveChat(chat._id);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat, socket]);
 
   useEffect(() => {
-    if (!socket) return;
+    if (!socket) return undefined;
 
-    socket.on("newMessage", (data) => {
-      if (data.chatId === chat?._id) {
-        setMessages((prev) => [...prev, data.message]);
-        scrollToBottom();
-        markChatAsRead();
-      }
-    });
+    // IMPORTANT: these handlers are named, and the cleanup passes the SAME
+    // reference to socket.off.
+    //
+    // The previous code called socket.off("newMessage") with no handler, which
+    // removes EVERY listener registered for that event — including the one
+    // ChatPage registers to keep the sidebar's last message and unread badge up
+    // to date. Because this effect re-runs on every chat switch, opening a
+    // second conversation silently killed the sidebar's subscription for the
+    // rest of the session.
+    const handleNewMessage = (data) => {
+      if (data.chatId !== chat?._id) return;
 
-    socket.on("userTyping", (data) => {
-      if (String(data.userId) !== String(currentUserId)) {
-        setTyping((prev) => {
-          if (data.isTyping) {
-            return [...prev.filter((u) => u.userId !== data.userId), data];
-          } else {
-            return prev.filter((u) => u.userId !== data.userId);
-          }
-        });
-      }
-    });
+      setMessages((prev) => {
+        // The server echoes the message back to its sender too, and a reconnect
+        // can replay one. De-duplicate on the persisted _id so a message is
+        // never rendered twice.
+        if (prev.some((m) => String(m._id) === String(data.message._id))) return prev;
+        return [...prev, data.message];
+      });
+      scrollToBottom();
+      markChatAsRead();
+    };
+
+    const handleUserTyping = (data) => {
+      if (String(data.userId) === String(currentUserId)) return;
+      setTyping((prev) =>
+        data.isTyping
+          ? [...prev.filter((u) => u.userId !== data.userId), data]
+          : prev.filter((u) => u.userId !== data.userId),
+      );
+    };
+
+    socket.on("newMessage", handleNewMessage);
+    socket.on("userTyping", handleUserTyping);
 
     return () => {
-      socket.off("newMessage");
-      socket.off("userTyping");
+      socket.off("newMessage", handleNewMessage);
+      socket.off("userTyping", handleUserTyping);
     };
-  }, [socket, chat, user]);
+  }, [socket, chat, currentUserId]);
 
   useEffect(() => {
     scrollToBottom();
@@ -670,9 +690,11 @@ function ChatWindow({ chat }) {
   };
 
   const markChatAsRead = async () => {
-    if (!chat || !socket) return;
+    if (!chat) return;
     try {
-      socket.emit("markChatAsRead", chat._id);
+      // Was also emitting a socket 'markChatAsRead' event, which no server
+      // handler consumed. Read receipts are an HTTP write
+      // (PUT /api/chats/:chatId/read) — the REST call is the only path.
       await chatAPI.markChatAsRead(chat._id);
     } catch (error) {
       console.error("Error marking chat as read:", error);
@@ -1117,16 +1139,20 @@ function ChatPage() {
   const [chats, setChats] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
-  const { socket } = useSocket();
+  const { socket, joinChats } = useSocket();
 
   useEffect(() => {
     fetchChats();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (!socket) return;
+    if (!socket) return undefined;
 
-    socket.on("newMessage", (data) => {
+    // Named handler + matching socket.off — see the note in ChatWindow. This
+    // listener and ChatWindow's listen to the same event, so an unqualified
+    // socket.off("newMessage") in either one removes both.
+    const handleSidebarUpdate = (data) => {
       setChats((prevChats) =>
         prevChats.map((chat) =>
           chat._id === data.chatId
@@ -1141,9 +1167,10 @@ function ChatPage() {
             : chat,
         ),
       );
-    });
+    };
 
-    return () => socket.off("newMessage");
+    socket.on("newMessage", handleSidebarUpdate);
+    return () => socket.off("newMessage", handleSidebarUpdate);
   }, [socket, selectedChat]);
 
   const fetchChats = async () => {
@@ -1152,8 +1179,9 @@ function ChatPage() {
       const response = await chatAPI.getChats();
       if (response.data.success) {
         setChats(response.data.chats);
-        const chatIds = response.data.chats.map((chat) => chat._id);
-        socket?.emit("joinChats", chatIds);
+        // Via the context helper (not a raw emit) so the rooms are remembered
+        // and re-joined automatically after a reconnect.
+        joinChats(response.data.chats.map((chat) => chat._id));
       }
     } catch (error) {
       console.error("Failed to fetch chats:", error);

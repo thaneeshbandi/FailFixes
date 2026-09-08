@@ -2,6 +2,8 @@
 // Also runs for the test suite, which requires this module directly.
 require("./config/env").validateEnvOrExit();
 
+const { randomUUID } = require("crypto");
+
 const express = require("express");
 const cors = require("cors");
 const { corsOptions } = require("./config/cors");
@@ -120,14 +122,41 @@ app.use(
 // Compression
 app.use(compression());
 
+// ✅ REQUEST ID
+// Every request gets an id, echoed to the client as X-Request-Id and attached to
+// the access log and to any error log for the same request. Without it, two
+// concurrent requests interleave in the log with nothing tying their lines
+// together — which is the single thing that made production issues here hard to
+// trace. An inbound X-Request-Id is honoured (so a proxy or the frontend can
+// correlate) but length-capped and stripped of anything that could forge a log
+// line or inject a header.
+app.use((req, res, next) => {
+  const inbound = req.headers["x-request-id"];
+  const clean =
+    typeof inbound === "string" ? inbound.replace(/[^\w.-]/g, "").slice(0, 64) : "";
+
+  req.id = clean || randomUUID();
+  res.set("X-Request-Id", req.id);
+  next();
+});
+
 // Logging
+morgan.token("id", (req) => req.id || "-");
+
 if (process.env.NODE_ENV === "development") {
-  app.use(morgan("dev"));
+  app.use(morgan(":id :method :url :status :response-time ms"));
   // The previous verbose logger here dumped req.body on every request, which
   // meant cleartext passwords in the dev console (and anywhere those logs were
   // pasted). morgan already records method/url/status/time.
 } else if (process.env.NODE_ENV === "production") {
-  app.use(morgan("combined"));
+  // 'combined' plus the request id, so an access-log line can be joined to the
+  // error-log line for the same request.
+  app.use(
+    morgan(
+      ':remote-addr - :remote-user [:date[clf]] ":method :url HTTP/:http-version" ' +
+        ':status :res[content-length] ":referrer" ":user-agent" req_id=:id',
+    ),
+  );
 }
 
 // ✅ ROOT ENDPOINT
@@ -308,36 +337,46 @@ app.use("/api/chats", chatRoutes);
 app.use("/api/ai", aiRoutes);
 
 // ✅ 404 Handler
+//
+// The endpoint catalogue this used to return on every 404 is now
+// development-only. In production it was free reconnaissance: a single request
+// to any bad path enumerated the entire API surface. The route list also drifted
+// from reality (it advertised routes that were never implemented), which is
+// exactly the class of problem this pass exists to remove.
 app.use("*", (req, res) => {
   if (process.env.NODE_ENV !== "test") {
-    console.log(`❌ 404: ${req.method} ${req.originalUrl} not found`);
+    console.log(`❌ 404: ${req.method} ${req.originalUrl} not found [req_id=${req.id}]`);
   }
 
-  res.status(404).json({
+  const body = {
     success: false,
     message: `Route ${req.method} ${req.originalUrl} not found`,
-    availableEndpoints: {
+    code: "NOT_FOUND",
+    requestId: req.id,
+  };
+
+  if (process.env.NODE_ENV === "development") {
+    // Kept accurate by hand; every entry below is asserted by
+    // tests/routes.contract.test.js, which fails if a listed route 404s.
+    body.availableEndpoints = {
       root: "GET /",
-      health: "GET /health or /api/health",
-      cache:
-        process.env.NODE_ENV === "development"
-          ? {
-              stats: "GET /api/cache/stats",
-              clear: "DELETE /api/cache/clear",
-            }
-          : undefined,
+      health: "GET /health, GET /api/health",
+      cache: {
+        stats: "GET /api/cache/stats",
+        clear: "DELETE /api/cache/clear",
+      },
       auth: {
         register: "POST /api/auth/register",
+        signup: "POST /api/auth/signup",
         login: "POST /api/auth/login",
         me: "GET /api/auth/me",
-        verifyEmail: "GET /api/auth/verify-email/:token",
-        updateProfile: "PUT /api/auth/profile",
+        logout: "POST /api/auth/logout",
         changePassword: "PUT /api/auth/change-password",
       },
       stories: {
         list: "GET /api/stories",
         byId: "GET /api/stories/:id",
-        byAuthor: "GET /api/stories/author/:username",
+        byAuthor: "GET /api/stories/author/:authorUsername",
         create: "POST /api/stories",
         update: "PUT /api/stories/:id",
         delete: "DELETE /api/stories/:id",
@@ -348,25 +387,34 @@ app.use("*", (req, res) => {
       },
       users: {
         profile: "GET /api/users/profile/:username",
-        follow: "POST /api/users/:username/follow",
-        unfollow: "DELETE /api/users/:username/follow",
+        trackProfileView: "POST /api/users/profile/:userId/view",
+        followToggle: "POST /api/users/:username/follow",
+        followers: "GET /api/users/:username/followers",
+        following: "GET /api/users/:username/following",
         dashboard: "GET /api/users/dashboard",
+        suggested: "GET /api/users/suggested",
+        search: "GET /api/users/search?q=",
         stats: "GET /api/users/me/stats",
         stories: "GET /api/users/me/stories",
         feed: "GET /api/users/me/feed",
-        search: "GET /api/users/search",
+        liked: "GET /api/users/me/liked",
+        myProfile: "GET /api/users/me/profile",
+        updateProfile: "PUT /api/users/me/profile",
       },
       chats: {
         list: "GET /api/chats",
-        create: "POST /api/chats/direct",
+        createDirect: "POST /api/chats/direct",
         messages: "GET /api/chats/:chatId/messages",
-        sendMessage: "POST /api/chats/:chatId/messages",
+        markRead: "PUT /api/chats/:chatId/read",
+        note: "Messages are SENT over Socket.IO ('sendMessage'), not over HTTP.",
       },
       ai: {
         generate: "POST /api/ai/generate-story",
       },
-    },
-  });
+    };
+  }
+
+  res.status(404).json(body);
 });
 
 // ✅ GLOBAL ERROR HANDLER

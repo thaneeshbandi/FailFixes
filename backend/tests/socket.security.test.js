@@ -101,7 +101,9 @@ beforeAll(async () => {
 
   httpServer = http.createServer();
   ioServer = new Server(httpServer, { cors: { origin: false } });
-  initSocket(ioServer);
+  // initSocket is async (it may attach the Redis adapter) — must be awaited
+  // before any client connects, or the auth middleware would not yet be registered.
+  await initSocket(ioServer, { skipAdapter: true });
 
   await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
   port = httpServer.address().port;
