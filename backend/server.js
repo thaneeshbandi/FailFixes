@@ -12,11 +12,11 @@ const { initSocket } = require('./socket');
 const { getAllowedOrigins } = require('./config/cors');
 const config = require('./config/config');
 
-// 🔎 Resend status on startup (no direct SDK import here)
-console.log('📧 EMAIL PROVIDER STATUS:', {
-  usingResend: !!process.env.RESEND_API_KEY,
-  resendFrom: process.env.RESEND_FROM_EMAIL || 'not set',
-});
+// NOTE: this file used to log an "EMAIL PROVIDER STATUS" banner on every boot.
+// There is no email in this application: utils/emailService.js (Resend) existed
+// but nothing imported it, and the verify-email route had already been removed.
+// The module and the `resend` dependency are gone; a startup banner advertising
+// a feature that does not exist is worse than silence.
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (err) => {

@@ -70,7 +70,7 @@ Each item below maps to code in this repository.
 | Real-time messaging, typing indicators, presence | `backend/socket/index.js` |
 | AI story generation (Groq) | `backend/controllers/siController.js` |
 
-**Not built:** email verification, password reset, group chat, notifications,
+**Not built:** email of any kind (no verification, no password reset), group chat, notifications,
 bookmarks (the schema field exists but no endpoint writes it), analytics,
 comment editing or deletion, moderation tooling, admin UI. The `role` field
 (`user` / `moderator` / `admin`) exists on the User schema but **no route checks
@@ -149,8 +149,9 @@ GitHub Actions, CodeQL.
 **External services** — MongoDB Atlas (production), Redis, Groq
 (`llama-3.3-70b-versatile`).
 
-`resend` is listed in `backend/package.json` but nothing imports it; email is not
-implemented.
+There is **no email**. `utils/emailService.js` (Resend) and the `resend`
+dependency were removed in this pass — nothing imported them, and the
+verify-email route had already been deleted.
 
 ---
 
