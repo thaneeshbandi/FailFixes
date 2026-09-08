@@ -6,7 +6,8 @@ require('dotenv').config();
 const http = require('http');
 const socketIo = require('socket.io');
 const app = require('./app');
-const { connectDB } = require('./utils/database');
+const { quitRedis } = require('./app');
+const { connectDB, beginShutdown } = require('./utils/database');
 const { initSocket } = require('./socket');
 const { getAllowedOrigins } = require('./config/cors');
 const config = require('./config/config');
@@ -127,16 +128,36 @@ const startServer = async () => {
     const gracefulShutdown = (signal) => {
       console.log(`\n👋 ${signal} received, shutting down gracefully...`);
 
+      // Suppress the database layer's auto-reconnect: from here on a
+      // 'disconnected' event is expected, not a fault to recover from.
+      beginShutdown();
+
+      // This module is the ONLY owner of process lifecycle. app.js and
+      // utils/database.js used to register competing handlers; a single signal
+      // ran three sequences at once and the first process.exit() truncated the
+      // rest. The order below matters:
+      //
+      //   1. stop accepting HTTP connections
+      //   2. disconnect sockets and close the adapter's Redis clients — sockets
+      //      must go first so their disconnect handlers can decrement the shared
+      //      presence counters while Redis is still reachable
+      //   3. close the cache's Redis client
+      //   4. close MongoDB
       server.close(async () => {
         console.log('💤 HTTP server closed');
 
         try {
-          // Release the Socket.IO adapter's pub/sub connections before Mongo, so
-          // a slow database close cannot leave Redis connections dangling.
           await socketRuntime.close();
-          console.log('📤 Socket.IO Redis connections closed');
+          console.log('📤 Socket.IO connections closed');
         } catch (err) {
-          console.error('❌ Error closing Socket.IO Redis connections:', err);
+          console.error('❌ Error closing Socket.IO connections:', err);
+        }
+
+        try {
+          await quitRedis();
+          console.log('📤 Redis cache connection closed');
+        } catch (err) {
+          console.error('❌ Error closing Redis connection:', err);
         }
 
         try {

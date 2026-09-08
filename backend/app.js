@@ -423,21 +423,23 @@ app.use("*", (req, res) => {
 // returned `stack: err.stack` to the client outside production.
 app.use(errorHandler);
 
-// ✅ GRACEFUL SHUTDOWN
-process.on("SIGTERM", async () => {
-  console.log("📴 SIGTERM received, shutting down gracefully...");
-  await quitRedis();
-  process.exit(0);
-});
+// NOTE: this module registers NO process-signal handlers.
+//
+// It previously installed its own SIGTERM/SIGINT handlers that closed Redis and
+// called process.exit(0) — while server.js installed handlers that closed the
+// HTTP server and MongoDB, and utils/database.js installed a third set. All
+// three fired on one signal and raced, and whichever called process.exit first
+// truncated the others. server.js now owns shutdown and calls quitRedis() as
+// part of one ordered sequence.
+//
+// It also means requiring this module (as the test suite does) has no side
+// effect on the process's signal handling.
 
-process.on("SIGINT", async () => {
-  console.log("📴 SIGINT received, shutting down gracefully...");
-  await quitRedis();
-  process.exit(0);
-});
-
-// ✅ Export app and Redis client
 module.exports = app;
-module.exports.redisClient = getRedisClient();
+module.exports.quitRedis = quitRedis;
 module.exports.invalidateCache = invalidateCache;
 module.exports.cacheMiddleware = cacheMiddleware;
+// A getter, not a captured value: `getRedisClient()` returns null at module load
+// because initRedis() connects asynchronously. The old
+// `module.exports.redisClient = getRedisClient()` therefore froze null forever.
+Object.defineProperty(module.exports, "redisClient", { get: getRedisClient });
