@@ -211,3 +211,96 @@ exports.getMe = async (req, res, next) => {
     return next(error);
   }
 };
+
+// ========== LOGOUT ==========
+// @desc    Sign out. Increments tokenVersion, which revokes EVERY token issued
+//          for this account (see the note below).
+// @route   POST /api/auth/logout
+// @access  Private
+//
+// WHY THIS REVOKES ALL SESSIONS, DELIBERATELY:
+// FailFixes issues stateless access tokens that carry no per-session identity
+// (no `jti`, no server-side session record). There is therefore no way to
+// invalidate one device's token without invalidating the others. The two honest
+// options were:
+//
+//   (a) make logout client-side only — the token stays valid until it expires,
+//       so "log out" would not actually end the session; or
+//   (b) bump tokenVersion, ending every session for the account.
+//
+// (b) is chosen because a logout that does not revoke is a security control in
+// name only, and because "sign out everywhere" is the safer default for the
+// case that actually matters — a user logging out because they think their
+// account is compromised. The trade-off (other devices are signed out too) is
+// stated in the response message and in the README.
+exports.logout = async (req, res, next) => {
+  try {
+    await User.findByIdAndUpdate(
+      req.user._id,
+      { $inc: { tokenVersion: 1 } },
+      { runValidators: false }
+    );
+
+    return res.json({
+      success: true,
+      message: 'Signed out. All sessions for this account have been ended.',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// ========== CHANGE PASSWORD ==========
+// @desc    Change the current user's password and revoke all other sessions
+// @route   PUT /api/auth/change-password
+// @access  Private
+exports.changePassword = async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    // `password` is select:false, so it must be requested explicitly.
+    const user = await User.findById(req.user._id).select('+password');
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'User account not found. Please login again.',
+        code: 'USER_NOT_FOUND',
+      });
+    }
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      if (process.env.NODE_ENV !== 'test') {
+        // Identifier only — never the submitted password.
+        console.warn('Failed password change for account:', user.username || user.email);
+      }
+      return res.status(401).json({
+        success: false,
+        message: 'Current password is incorrect',
+        code: 'INVALID_CREDENTIALS',
+      });
+    }
+
+    // Assigning triggers the bcrypt pre-save hook in models/User.js. Writing via
+    // findByIdAndUpdate would BYPASS that hook and store the password in
+    // cleartext, which is exactly the bug utils/allowedUpdates.js exists to stop.
+    user.password = newPassword;
+
+    // A password change must end sessions that may have been established with
+    // the old credentials.
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
+    await user.save();
+
+    // Issue a replacement token so the device performing the change stays signed
+    // in; every other outstanding token is now invalid.
+    const token = user.generateAuthToken();
+
+    return res.json({
+      success: true,
+      message: 'Password updated. All other sessions have been signed out.',
+      token,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};

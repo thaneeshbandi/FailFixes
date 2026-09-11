@@ -1130,55 +1130,70 @@ exports.getUserFollowing = async (req, res) => {
   }
 };
 
-// Placeholder methods that can be implemented later
-exports.getUserAnalytics = async (req, res) => {
+
+// @desc    Stories the current user has liked
+// @route   GET /api/users/me/liked
+// @access  Private
+//
+// This was a placeholder that always returned an empty array. The data it needed
+// already existed: User.likedStories is maintained by
+// User.updatePreferencesFromLike (on like) and $pull-ed in storyController.likeStory
+// (on unlike), so the endpoint only ever needed to read it.
+exports.getLikedStories = async (req, res, next) => {
   try {
-    // Placeholder for analytics data
-    res.json({ 
-      success: true, 
-      analytics: {
-        viewTrends: [],
-        engagementRate: 0,
-        topStories: []
-      }
+    const pageNum = asBoundedInt(req.query.page, { min: 1, max: 10000, fallback: 1 });
+    const limitNum = asBoundedInt(req.query.limit, { min: 1, max: 50, fallback: 10 });
+
+    const user = await User.findById(req.user._id).select('likedStories').lean();
+    const likedIds = (user && user.likedStories) || [];
+
+    if (likedIds.length === 0) {
+      return res.json({
+        success: true,
+        stories: [],
+        pagination: { currentPage: pageNum, totalPages: 0, totalStories: 0, hasNext: false, hasPrev: false },
+      });
+    }
+
+    // Only published stories are returned: a story can be unpublished after it
+    // was liked, and this endpoint must not become a way to read a draft.
+    const filter = { _id: { $in: likedIds }, status: 'published' };
+
+    const [stories, total] = await Promise.all([
+      Story.find(filter)
+        .populate('author', 'name username avatar')
+        .sort({ createdAt: -1 })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean(),
+      Story.countDocuments(filter),
+    ]);
+
+    res.json({
+      success: true,
+      stories: stories.map((s) => ({
+        ...s,
+        isLiked: true,
+        displayAuthor: s.authorUsername || s.author?.username || s.author?.name || 'Anonymous',
+        stats: {
+          likes: s.stats?.likes || 0,
+          comments: s.stats?.comments || 0,
+          views: s.stats?.views || 0,
+        },
+      })),
+      pagination: {
+        currentPage: pageNum,
+        totalPages: Math.ceil(total / limitNum),
+        totalStories: total,
+        hasNext: pageNum * limitNum < total,
+        hasPrev: pageNum > 1,
+      },
     });
   } catch (err) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error fetching analytics' 
-    });
+    next(err);
   }
 };
 
-exports.getLikedStories = async (req, res) => {
-  try {
-    // Placeholder for liked stories
-    res.json({ 
-      success: true, 
-      likedStories: [] 
-    });
-  } catch (err) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error fetching liked stories' 
-    });
-  }
-};
-
-exports.getUserActivity = async (req, res) => {
-  try {
-    // Placeholder for user activity
-    res.json({ 
-      success: true, 
-      activities: [] 
-    });
-  } catch (err) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error fetching user activity' 
-    });
-  }
-};
 
 exports.getUserProfile = async (req, res) => {
   try {
@@ -1235,41 +1250,4 @@ exports.updateUserProfile = async (req, res, next) => {
   }
 };
 
-exports.getViewTrends = async (req, res) => {
-  try {
-    // Placeholder for view trends
-    res.json({ 
-      success: true, 
-      trends: {
-        daily: [],
-        weekly: [],
-        monthly: []
-      }
-    });
-  } catch (err) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error fetching view trends' 
-    });
-  }
-};
 
-exports.getEngagementMetrics = async (req, res) => {
-  try {
-    // Placeholder for engagement metrics
-    res.json({ 
-      success: true, 
-      metrics: {
-        likes: 0,
-        comments: 0,
-        shares: 0,
-        views: 0
-      }
-    });
-  } catch (err) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Error fetching engagement metrics' 
-    });
-  }
-};

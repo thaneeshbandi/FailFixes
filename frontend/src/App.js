@@ -8,6 +8,7 @@ import { SocketProvider } from './context/SocketContexts'; // ✅ ADD THIS
 import Header from './components/layout/header';
 import Footer from './components/layout/Footer';
 import ProtectedRoute from './components/ProtectedRoute';
+import ErrorBoundary from './components/ErrorBoundary';
 
 // Import Pages
 import Home from './pages/Home';
@@ -284,6 +285,12 @@ function App() {
                 position: 'relative',
                 zIndex: 1
               }}>
+                {/* ErrorBoundary existed in the codebase but was never mounted,
+                    so any render-time exception blanked the entire page with no
+                    message. It wraps the routed content (not the shell) so the
+                    header and footer survive a crash and the user can navigate
+                    away. */}
+                <ErrorBoundary>
                 <Routes>
                   {/* 🏠 Home Route - Landing + Feed combined */}
                   <Route path="/" element={<Home />} />
@@ -352,6 +359,7 @@ function App() {
                   {/* 🚫 Catch-all route - redirect to home */}
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
+                </ErrorBoundary>
               </main>
               
               <Footer />

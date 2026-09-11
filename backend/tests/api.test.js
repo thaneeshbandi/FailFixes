@@ -209,9 +209,28 @@ describe('📚 Stories', () => {
 });
 
 describe('👤 User Operations', () => {
-  test('should search users', async () => {
+  test('user search requires authentication', async () => {
     const res = await request(app).get('/api/users/search?q=test');
-    expect([200, 404]).toContain(res.status);
+    expect(res.status).toBe(401);
+  });
+
+  test('authenticated user search returns matching users', async () => {
+    // This route existed as a controller but was never mounted, so the
+    // "start a chat with..." people-picker in the UI always got a 404.
+    const res = await request(app)
+      .get('/api/users/search?q=test')
+      .set('Authorization', `Bearer ${authToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.users)).toBe(true);
+  });
+
+  test('user search rejects a missing query rather than scanning everything', async () => {
+    const res = await request(app)
+      .get('/api/users/search')
+      .set('Authorization', `Bearer ${authToken}`);
+    expect(res.status).toBe(400);
   });
 
   test('should get user profile', async () => {

@@ -102,10 +102,17 @@ const setupConnectionHandlers = () => {
 
   // Connection disconnected
   mongoose.connection.on('disconnected', () => {
+    if (isShuttingDown) {
+      // Expected during shutdown — do not try to reconnect a connection we are
+      // deliberately closing.
+      console.log('📤 Mongoose disconnected (shutting down)');
+      return;
+    }
+
     console.warn('⚠️  Mongoose disconnected from MongoDB');
-    
+
     // Attempt reconnection if not in shutdown process
-    if (!isShuttingDown && connectionAttempts < maxRetryAttempts) {
+    if (connectionAttempts < maxRetryAttempts) {
       console.log('🔄 Attempting to reconnect...');
       setTimeout(() => {
         connectDB();
@@ -234,15 +241,22 @@ const getStats = () => {
   };
 };
 
-// Initialize database connection with all handlers
+// Initialize database connection.
+//
+// NOTE: this deliberately does NOT call setupShutdownHandlers(). Process
+// lifecycle is owned by server.js alone. Three modules used to register
+// SIGINT/SIGTERM handlers independently (server.js, app.js and this file), so a
+// single Ctrl-C ran three different shutdown sequences concurrently — each
+// racing to close the same connections and to call process.exit(). The handlers
+// remain exported for a caller that genuinely wants them.
 const initializeDatabase = async () => {
   try {
     console.log('🚀 Initializing database connection...');
-    
-    // Setup event handlers first
+
+    // Connection *event* handlers are still useful: they log reconnects and
+    // errors. Only the process-signal handlers are removed.
     setupConnectionHandlers();
-    setupShutdownHandlers();
-    
+
     // Connect to database
     await connectDB();
     
@@ -281,8 +295,21 @@ const reconnect = async () => {
   }
 };
 
+/**
+ * Tell this module a deliberate shutdown has begun.
+ *
+ * Without it the `disconnected` event fired while server.js is closing the
+ * connection looks identical to a network drop, and the handler above schedules
+ * a reconnect against a database we are intentionally leaving.
+ */
+const beginShutdown = () => {
+  isShuttingDown = true;
+};
+
 module.exports = {
   connectDB: initializeDatabase, // Use the enhanced initialization
+  beginShutdown,
+  setupShutdownHandlers, // exported, but not registered by this module
   disconnect,
   reconnect,
   healthCheck,

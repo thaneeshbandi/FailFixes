@@ -5,13 +5,16 @@ const {
   signup,
   login,
   getMe,
+  logout,
+  changePassword,
 } = require('../controllers/authController');
 const { auth } = require('../middleware/auth');
 const {
   validateSignup,
   validateLogin,
+  validatePasswordChange,
 } = require('../middleware/validation');
-const { authLimiter } = require('../middleware/rateLimit');
+const { preAuthLimiter, authLimiter, writeLimiter } = require('../middleware/rateLimit');
 
 // NOTE: a debug middleware previously logged `req.headers.authorization` and
 // `req.body` on every auth request, writing raw bearer tokens and cleartext
@@ -29,6 +32,32 @@ router.post('/login', authLimiter, validateLogin, login);
 
 // GET /api/auth/me - Get current user info
 router.get('/me', auth, getMe);
+
+// POST /api/auth/logout - End the session by bumping tokenVersion.
+// This is what makes the tokenVersion check in utils/token.js reachable: before
+// this route existed the field was compared on every request but never changed,
+// so no token could ever actually be revoked.
+// Two layers, and both are needed:
+//   preAuthLimiter (IP) runs BEFORE `auth`, so the JWT verification and the
+//     User.findById() inside it are themselves bounded.
+//   writeLimiter (user) runs AFTER `auth`, so the per-account budget keys on
+//     the user id rather than an address shared by a whole NAT.
+// authLimiter would be wrong here: its 10-per-15-minutes is a credential
+// guessing budget, and applying it to logout would let a handful of sign-outs
+// lock the endpoint for everyone behind one address.
+router.post('/logout', preAuthLimiter, auth, writeLimiter, logout);
+
+// PUT /api/auth/change-password - Change password and revoke other sessions.
+// authLimiter (not writeLimiter) because this endpoint verifies a credential
+// with bcrypt, so it belongs in the same abuse budget as login.
+router.put(
+  '/change-password',
+  preAuthLimiter,
+  auth,
+  authLimiter,
+  validatePasswordChange,
+  changePassword,
+);
 
 // ⛔ verify-email route removed
 

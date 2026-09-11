@@ -6,16 +6,17 @@ require('dotenv').config();
 const http = require('http');
 const socketIo = require('socket.io');
 const app = require('./app');
-const { connectDB } = require('./utils/database');
+const { quitRedis } = require('./app');
+const { connectDB, beginShutdown } = require('./utils/database');
 const { initSocket } = require('./socket');
 const { getAllowedOrigins } = require('./config/cors');
 const config = require('./config/config');
 
-// 🔎 Resend status on startup (no direct SDK import here)
-console.log('📧 EMAIL PROVIDER STATUS:', {
-  usingResend: !!process.env.RESEND_API_KEY,
-  resendFrom: process.env.RESEND_FROM_EMAIL || 'not set',
-});
+// NOTE: this file used to log an "EMAIL PROVIDER STATUS" banner on every boot.
+// There is no email in this application: utils/emailService.js (Resend) existed
+// but nothing imported it, and the verify-email route had already been removed.
+// The module and the `resend` dependency are gone; a startup banner advertising
+// a feature that does not exist is worse than silence.
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
@@ -58,7 +59,11 @@ const startServer = async () => {
     // Implemented in ./socket. That module reuses utils/token.js for handshake
     // verification (algorithm pin + isActive + tokenVersion) and authorizes
     // every room join against chat participation.
-    initSocket(io);
+    //
+    // Async because it attaches the Redis adapter when REDIS_URL is set, which
+    // requires two connected Redis clients. Awaited before listen() so no socket
+    // can be accepted before the auth middleware and adapter are in place.
+    const socketRuntime = await initSocket(io);
 
     // Make io accessible to routes
     app.set('io', io);
@@ -78,7 +83,10 @@ const startServer = async () => {
 ║ 🕒 Started: ${new Date().toLocaleString().padEnd(38)} ║
 ║ 🚀 API URL: http://localhost:${PORT}/api${' '.repeat(25)} ║
 ║ 🏥 Health: http://localhost:${PORT}/api/health${' '.repeat(18)} ║
-║ 💬 Socket.IO: ENABLED${' '.repeat(33)} ║
+║ 💬 Socket.IO: ${(socketRuntime.presence.isShared()
+        ? 'ENABLED (Redis adapter)'
+        : 'ENABLED (single instance)'
+      ).padEnd(40)} ║
 ║ 📊 Database: ${
         config.database.uri.includes('mongodb.net')
           ? 'MongoDB Atlas'.padEnd(33)
@@ -120,8 +128,37 @@ const startServer = async () => {
     const gracefulShutdown = (signal) => {
       console.log(`\n👋 ${signal} received, shutting down gracefully...`);
 
+      // Suppress the database layer's auto-reconnect: from here on a
+      // 'disconnected' event is expected, not a fault to recover from.
+      beginShutdown();
+
+      // This module is the ONLY owner of process lifecycle. app.js and
+      // utils/database.js used to register competing handlers; a single signal
+      // ran three sequences at once and the first process.exit() truncated the
+      // rest. The order below matters:
+      //
+      //   1. stop accepting HTTP connections
+      //   2. disconnect sockets and close the adapter's Redis clients — sockets
+      //      must go first so their disconnect handlers can decrement the shared
+      //      presence counters while Redis is still reachable
+      //   3. close the cache's Redis client
+      //   4. close MongoDB
       server.close(async () => {
         console.log('💤 HTTP server closed');
+
+        try {
+          await socketRuntime.close();
+          console.log('📤 Socket.IO connections closed');
+        } catch (err) {
+          console.error('❌ Error closing Socket.IO connections:', err);
+        }
+
+        try {
+          await quitRedis();
+          console.log('📤 Redis cache connection closed');
+        } catch (err) {
+          console.error('❌ Error closing Redis connection:', err);
+        }
 
         try {
           await require('mongoose').connection.close();

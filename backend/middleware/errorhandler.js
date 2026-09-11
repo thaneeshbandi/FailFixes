@@ -122,10 +122,16 @@ function classify(error) {
 const errorHandler = (error, req, res, next) => {
   const { status, body } = classify(error);
 
+  // Correlation: the same id is on the access-log line, in this error log, and
+  // in the response the client received. A user can paste the id from a failed
+  // request and it locates the exact server-side stack.
+  if (req.id) body.requestId = req.id;
+
   if (!isTest()) {
     // Server-side detail. Includes the stack for 5xx, which is where it is
     // actually useful; 4xx are expected and logged as one line.
     const context = {
+      requestId: req.id,
       method: req.method,
       url: req.originalUrl,
       status,

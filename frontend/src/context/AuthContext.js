@@ -9,6 +9,7 @@ import {
 import { AutoFixHigh } from '@mui/icons-material';
 import { keyframes } from '@mui/material/styles';
 import axios from 'axios';
+import { authAPI } from '../services/api';
 
 // ✅ API BASE URL CONFIGURATION
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
@@ -267,9 +268,26 @@ export function AuthProvider({ children }) {
   };
 
   // ✅ LOGOUT FUNCTION
-  const logout = () => {
-    console.log('👋 Logging out user');
-    clearAuth();
+  //
+  // Logout is now a real server-side operation: POST /api/auth/logout increments
+  // the account's tokenVersion, which invalidates every token issued for it.
+  // Previously this only cleared localStorage, so the token stayed valid for its
+  // full two-day lifetime and anyone who had copied it kept access.
+  //
+  // Because tokens carry no per-session identity, this signs the account out
+  // everywhere — a deliberate trade documented in docs/ARCHITECTURE.md.
+  //
+  // Local state is cleared even if the request fails: the user asked to be
+  // signed out of this device, and that must not depend on the network.
+  const logout = async () => {
+    try {
+      await authAPI.logout();
+      console.log('👋 Logged out — all sessions revoked');
+    } catch (error) {
+      console.warn('⚠️ Logout request failed; clearing local session anyway:', error.message);
+    } finally {
+      clearAuth();
+    }
   };
 
   // ✅ UPDATE USER FUNCTION

@@ -61,6 +61,20 @@ api.interceptors.response.use(
   }
 );
 
+/**
+ * Serialise params into a query string, dropping empty values.
+ * This exact loop was copy-pasted into eight functions below; one definition
+ * means one place for a caller to get it wrong.
+ */
+const buildQuery = (params = {}) => {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') qs.append(key, value);
+  });
+  const str = qs.toString();
+  return str ? `?${str}` : '';
+};
+
 // ✅ VIEW TRACKING CACHE (prevents duplicate increments)
 const viewCache = new Map();
 const VIEW_CACHE_DURATION = 5000; // 5 seconds
@@ -81,16 +95,7 @@ const shouldTrackView = (key) => {
 // ========== STORIES API ==========
 export const storiesAPI = {
   // Get all stories with filters
-  getAllStories: (params = {}) => {
-    const queryParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        queryParams.append(key, value);
-      }
-    });
-    const queryString = queryParams.toString();
-    return api.get(`/stories${queryString ? `?${queryString}` : ''}`);
-  },
+  getAllStories: (params = {}) => api.get(`/stories${buildQuery(params)}`),
 
   // Alias for getAllStories
   getStories: (params = {}) => storiesAPI.getAllStories(params),
@@ -99,16 +104,7 @@ export const storiesAPI = {
   getStoriesByAuthor: async (authorUsername, params = {}) => {
     try {
       console.log('📡 Fetching stories for author:', authorUsername);
-      const queryParams = new URLSearchParams();
-      Object.entries(params).forEach(([key, value]) => {
-        if (value !== undefined && value !== null && value !== '') {
-          queryParams.append(key, value);
-        }
-      });
-      const queryString = queryParams.toString();
-      const response = await api.get(
-        `/stories/author/${authorUsername}${queryString ? `?${queryString}` : ''}`
-      );
+      const response = await api.get(`/stories/author/${authorUsername}${buildQuery(params)}`);
       console.log('✅ Stories API response:', response.data);
       return response;
     } catch (error) {
@@ -177,45 +173,35 @@ export const storiesAPI = {
   },
 
   // Get story comments
-  getComments: (id, params = {}) => {
-    const queryParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        queryParams.append(key, value);
-      }
-    });
-    const queryString = queryParams.toString();
-    return api.get(`/stories/${id}/comments${queryString ? `?${queryString}` : ''}`);
-  },
+  getComments: (id, params = {}) => api.get(`/stories/${id}/comments${buildQuery(params)}`),
 
-  // Delete comment
-  deleteComment: (storyId, commentId) => {
-    console.log('🗑️ Deleting comment:', commentId);
-    return api.delete(`/stories/${storyId}/comments/${commentId}`);
-  },
-
-  // Update comment
-  updateComment: (storyId, commentId, commentData) => {
-    console.log('✏️ Updating comment:', commentId);
-    return api.put(`/stories/${storyId}/comments/${commentId}`, commentData);
-  },
+  // NOTE: no deleteComment / updateComment. Both used to be declared here and
+  // called /stories/:id/comments/:commentId, which the backend never
+  // implemented — editing and deleting comments is not a feature of this app.
 };
 
 // ========== AUTH API ==========
+// Every function here maps to a route that exists in backend/routes/auth.js.
+// `updateProfile` used to point at PUT /auth/profile, which was never
+// implemented — profile updates live under /users/me/profile (see userAPI).
 export const authAPI = {
   register: (userData) => api.post('/auth/register', userData),
   login: (credentials) => api.post('/auth/login', credentials),
   getMe: () => api.get('/auth/me'),
-  updateProfile: (userData) => api.put('/auth/profile', userData),
-  changePassword: (passwordData) => api.put('/auth/change-password', passwordData),
+
+  // Ends every session for the account (the server increments tokenVersion).
+  // Stateless tokens carry no per-session id, so single-device logout is not
+  // possible without a session store — see docs/ARCHITECTURE.md.
   logout: () => api.post('/auth/logout'),
+
+  // Returns a fresh token: the change revokes all sessions, including this one,
+  // so the caller must swap in the new token or it will be signed out.
+  changePassword: (passwordData) => api.put('/auth/change-password', passwordData),
 };
 
 // ========== DASHBOARD API ==========
 export const dashboardAPI = {
   testConnection: () => api.get('/health'),
-  testUserRoutes: () => api.get('/users/test'),
-  debugUserStories: () => api.get('/users/debug/stories'),
 
   getDashboard: async () => {
     try {
@@ -235,20 +221,11 @@ export const dashboardAPI = {
 
   getUserStats: () => api.get('/users/me/stats'),
 
-  getUserStories: (params = {}) => {
-    const queryParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        queryParams.append(key, value);
-      }
-    });
-    const queryString = queryParams.toString();
-    return api.get(`/users/me/stories${queryString ? `?${queryString}` : ''}`);
-  },
+  getUserStories: (params = {}) => api.get(`/users/me/stories${buildQuery(params)}`),
 
-  getUserAnalytics: () => api.get('/users/me/analytics'),
-  getLikedStories: () => api.get('/users/me/liked-stories'),
-  getUserActivity: () => api.get('/users/me/activity'),
+  // Was '/users/me/liked-stories', which 404'd; the route is '/users/me/liked'.
+  getLikedStories: (params = {}) => api.get(`/users/me/liked${buildQuery(params)}`),
+
   getUserProfile: () => api.get('/users/me/profile'),
   updateUserProfile: (profileData) => api.put('/users/me/profile', profileData),
 };
@@ -304,55 +281,24 @@ export const userAPI = {
     }
   },
 
-  // Unfollow user
-  unfollowUser: async (username) => {
-    try {
-      console.log('📡 Unfollowing user via API:', username);
-      const response = await api.delete(`/users/${username}/follow`);
-      console.log('✅ Unfollow API response:', response.data);
-      return response;
-    } catch (error) {
-      console.error('❌ Unfollow API error:', error);
-      throw error;
-    }
-  },
+  // NOTE: there is no separate unfollow call. POST /users/:username/follow is a
+  // TOGGLE on the server (backend/controllers/userController.js followUser), and
+  // the response's `isFollowing` reports the resulting state. A DELETE variant
+  // used to be declared here and 404'd on every call.
 
   // Get user followers
-  getUserFollowers: (username, params = {}) => {
-    const queryParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        queryParams.append(key, value);
-      }
-    });
-    const queryString = queryParams.toString();
-    return api.get(`/users/${username}/followers${queryString ? `?${queryString}` : ''}`);
-  },
+  getUserFollowers: (username, params = {}) =>
+    api.get(`/users/${username}/followers${buildQuery(params)}`),
 
   // Get user following
-  getUserFollowing: (username, params = {}) => {
-    const queryParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        queryParams.append(key, value);
-      }
-    });
-    const queryString = queryParams.toString();
-    return api.get(`/users/${username}/following${queryString ? `?${queryString}` : ''}`);
-  },
+  getUserFollowing: (username, params = {}) =>
+    api.get(`/users/${username}/following${buildQuery(params)}`),
 
   // Get personalized feed
   getUserFeed: async (params = {}) => {
     try {
       console.log('📡 Fetching user feed via API with params:', params);
-      const queryParams = new URLSearchParams();
-      Object.entries(params).forEach(([key, value]) => {
-        if (value !== undefined && value !== null && value !== '') {
-          queryParams.append(key, value);
-        }
-      });
-      const queryString = queryParams.toString();
-      const response = await api.get(`/users/me/feed${queryString ? `?${queryString}` : ''}`);
+      const response = await api.get(`/users/me/feed${buildQuery(params)}`);
       console.log('✅ Feed API response:', {
         success: response.data.success,
         storiesCount: response.data.stories?.length || 0,
@@ -369,17 +315,13 @@ export const userAPI = {
   // Get suggested users
   getSuggestedUsers: () => api.get('/users/suggested'),
 
-  // Search users
-  searchUsers: (params = {}) => {
-    const queryParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        queryParams.append(key, value);
-      }
-    });
-    const queryString = queryParams.toString();
-    return api.get(`/users/search${queryString ? `?${queryString}` : ''}`);
-  },
+  // Search users.
+  //
+  // Two bugs lived here: the route was never mounted on the backend (so this
+  // always 404'd), and callers passed `{ query: term }` while the controller
+  // reads `req.query.q`. Both are fixed — the signature now takes the term
+  // itself so a caller cannot get the parameter name wrong.
+  searchUsers: (term, params = {}) => api.get(`/users/search${buildQuery({ q: term, ...params })}`),
 
   // Update user profile
   updateProfile: (profileData) => api.put('/users/me/profile', profileData),
@@ -388,7 +330,6 @@ export const userAPI = {
 // ========== USERS API ALIASES ==========
 export const usersAPI = {
   followUser: userAPI.followUser,
-  unfollowUser: userAPI.unfollowUser,
   getUserProfile: userAPI.getUserProfile,
   trackProfileView: userAPI.trackProfileView,
   incrementProfileView: userAPI.incrementProfileView,
@@ -401,40 +342,28 @@ export const usersAPI = {
 };
 
 // ========== CHATS API ==========
+// Chat READS go over HTTP; chat WRITES go over Socket.IO. There is deliberately
+// no sendMessage here — messages are sent with the socket 'sendMessage' event
+// (see SocketContexts.js), which persists and fans out in one step.
 export const chatAPI = {
   getChats: () => api.get('/chats'),
 
   createDirectChat: (userId) => api.post('/chats/direct', { userId }),
 
-  getChatMessages: (chatId, params = {}) => {
-    const queryParams = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== '') {
-        queryParams.append(key, value);
-      }
-    });
-    const queryString = queryParams.toString();
-    return api.get(`/chats/${chatId}/messages${queryString ? `?${queryString}` : ''}`);
-  },
+  getChatMessages: (chatId, params = {}) =>
+    api.get(`/chats/${chatId}/messages${buildQuery(params)}`),
 
-  sendMessage: (chatId, messageData) => api.post(`/chats/${chatId}/messages`, messageData),
-
+  // Writes a read receipt for every message the current user has not yet read.
+  // Idempotent, and it deliberately does not bump the chat's updatedAt, so
+  // opening a conversation does not reorder the sidebar.
   markChatAsRead: (chatId) => api.put(`/chats/${chatId}/read`),
-
-  deleteChat: (chatId) => api.delete(`/chats/${chatId}`),
 };
 
-// ========== ANALYTICS API ==========
-export const analyticsAPI = {
-  getStoryPerformance: (id) => api.get(`/stories/${id}/analytics`),
-
-  getViewTrends: (period = '30d') => api.get(`/users/me/trends?period=${period}`),
-
-  getEngagementMetrics: () => api.get('/users/me/engagement'),
-
-  getStoryAnalytics: (id) => api.get(`/stories/${id}/analytics`),
-
-  getUserAnalytics: () => api.get('/users/me/analytics'),
-};
+// ========== ANALYTICS ==========
+// Removed. Every one of these called an endpoint that either never existed
+// (/stories/:id/analytics) or returned a hardcoded empty object with no data
+// model behind it (/users/me/trends, /engagement, /analytics). The backend
+// placeholders were deleted in the same pass; there is no analytics feature to
+// call until one is actually built.
 
 export default api;
