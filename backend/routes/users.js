@@ -49,7 +49,9 @@ router.get('/profile/:username', validateUsernameParam, optionalAuth, getUserPro
 router.get('/me/feed', auth, validatePagination, getUserFeed);
 router.get('/me/stats', auth, getUserStats);
 router.get('/me/stories', auth, validatePagination, getUserStories);
-router.get('/me/liked', auth, validatePagination, getLikedStories);
+// $in lookup + populate + countDocuments; listing budget, after `auth` so the
+// limiter keys per user.
+router.get('/me/liked', auth, searchLimiter, validatePagination, getLikedStories);
 router.get('/me/profile', auth, getUserProfile);
 // Field allowlist is enforced in the controller (utils/allowedUpdates.js);
 // validateProfileUpdate additionally type/length-checks the allowed fields.

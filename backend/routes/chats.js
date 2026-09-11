@@ -9,7 +9,7 @@ const {
 } = require('../controllers/chatController');
 
 const { auth } = require('../middleware/auth');
-const { writeLimiter } = require('../middleware/rateLimit');
+const { writeLimiter, searchLimiter } = require('../middleware/rateLimit');
 const {
   validateChatIdParam,
   validatePagination,
@@ -23,13 +23,25 @@ const {
 // Chat *reads* stay on HTTP, where pagination is natural.
 
 // GET /api/chats - list the current user's chats with unread counts
-router.get('/', auth, getChats);
+// searchLimiter (a listing budget), not writeLimiter: this is a read. It runs
+// an aggregation across every chat the caller participates in, so it is the
+// most expensive read in this router. Placed after `auth` so the limiter
+// keys on the user id rather than the IP.
+router.get('/', auth, searchLimiter, getChats);
 
 // POST /api/chats/direct - create or fetch a 1:1 chat
 router.post('/direct', auth, writeLimiter, createDirectChat);
 
 // GET /api/chats/:chatId/messages - paginated history
-router.get('/:chatId/messages', auth, validateChatIdParam, validatePagination, getChatMessages);
+// Paginated read backed by an aggregation with $slice; same listing budget.
+router.get(
+  '/:chatId/messages',
+  auth,
+  searchLimiter,
+  validateChatIdParam,
+  validatePagination,
+  getChatMessages,
+);
 
 // PUT /api/chats/:chatId/read - mark all messages read by the current user
 router.put('/:chatId/read', auth, writeLimiter, validateChatIdParam, markChatRead);

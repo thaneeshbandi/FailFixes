@@ -336,6 +336,24 @@ app.use("/api/chats", chatRoutes);
 // AI routes (no caching - always generate fresh)
 app.use("/api/ai", aiRoutes);
 
+/**
+ * Strip everything outside printable ASCII before a value reaches a log line.
+ *
+ * The 404 handler logs `req.method` and `req.originalUrl`, both attacker
+ * controlled. A value containing CR/LF (or other control characters) can forge
+ * additional log lines — "log injection" — letting an attacker fabricate entries
+ * that look like they came from the server, or hide their own activity.
+ *
+ * A wider allowlist than the one used for `X-Request-Id` above: a URL needs
+ * `/ ? & = %` to stay diagnostically useful, so the rule here is "printable
+ * ASCII only", which still removes every newline and control character. The
+ * length cap bounds how much an attacker can write into the log per request.
+ */
+const sanitizeForLog = (value, maxLength = 200) =>
+  String(value)
+    .replace(/[^\x20-\x7E]/g, "")
+    .slice(0, maxLength);
+
 // ✅ 404 Handler
 //
 // The endpoint catalogue this used to return on every 404 is now
@@ -345,7 +363,11 @@ app.use("/api/ai", aiRoutes);
 // exactly the class of problem this pass exists to remove.
 app.use("*", (req, res) => {
   if (process.env.NODE_ENV !== "test") {
-    console.log(`❌ 404: ${req.method} ${req.originalUrl} not found [req_id=${req.id}]`);
+    // req.id is already safe: it is either a generated UUID or an inbound header
+    // filtered through a stricter allowlist at the top of this file.
+    console.log(
+      `❌ 404: ${sanitizeForLog(req.method, 10)} ${sanitizeForLog(req.originalUrl)} not found [req_id=${req.id}]`,
+    );
   }
 
   const body = {

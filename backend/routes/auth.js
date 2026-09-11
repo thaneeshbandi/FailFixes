@@ -14,7 +14,7 @@ const {
   validateLogin,
   validatePasswordChange,
 } = require('../middleware/validation');
-const { authLimiter } = require('../middleware/rateLimit');
+const { authLimiter, writeLimiter } = require('../middleware/rateLimit');
 
 // NOTE: a debug middleware previously logged `req.headers.authorization` and
 // `req.body` on every auth request, writing raw bearer tokens and cleartext
@@ -37,7 +37,11 @@ router.get('/me', auth, getMe);
 // This is what makes the tokenVersion check in utils/token.js reachable: before
 // this route existed the field was compared on every request but never changed,
 // so no token could ever actually be revoked.
-router.post('/logout', auth, logout);
+// writeLimiter, not authLimiter: this route runs AFTER `auth`, so
+// writeLimiter's userOrIpKey resolves to the user id and the budget is
+// per-account. authLimiter is IP-keyed (10/15min), which behind a shared
+// NAT would let a handful of logouts lock the endpoint for everyone there.
+router.post('/logout', auth, writeLimiter, logout);
 
 // PUT /api/auth/change-password - Change password and revoke other sessions.
 // authLimiter (not writeLimiter) because this endpoint verifies a credential
