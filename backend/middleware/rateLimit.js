@@ -162,6 +162,42 @@ const searchLimiter = rateLimit(
 );
 
 /**
+ * Pre-authentication gate. IP-keyed, and mounted BEFORE `auth`.
+ *
+ * WHY THIS EXISTS (and why it does not replace the user-aware limiters):
+ * `protect` is not free — it verifies a JWT and then issues `User.findById()`.
+ * A limiter placed after it bounds the controller but not that work, so a
+ * caller could force one signature check and one database read per request
+ * indefinitely, including on requests that are ultimately answered 429.
+ *
+ * It cannot be user-keyed: it runs before `req.user` exists. That is the whole
+ * point — it is the only limiter that can protect authentication itself.
+ *
+ * BUDGET: 600 per minute per IP (10/sec sustained), deliberately generous.
+ * None of the existing IP-keyed limiters was appropriate here — authLimiter is
+ * a 10-per-15-minutes credential-guessing budget that ordinary browsing would
+ * exhaust in seconds, viewLimiter is 0.4/sec for anonymous analytics pings, and
+ * globalLimiter's 1.1/sec would throttle a shared office or carrier-grade NAT
+ * where hundreds of legitimate users share one address.
+ *
+ * 10/sec still cuts a flood by two to three orders of magnitude, which is all
+ * this needs to do: the work it protects is one indexed lookup, so the risk is
+ * amplification, not per-request cost. The one-minute window also means an IP
+ * that does trip it recovers in under a minute rather than fifteen. Override
+ * with PREAUTH_RATE_LIMIT_MAX / PREAUTH_RATE_LIMIT_WINDOW_MS where an operator
+ * sits behind unusually dense NAT.
+ */
+const preAuthLimiter = rateLimit(
+  limiterOptions({
+    prefix: 'preauth',
+    windowMs: num(process.env.PREAUTH_RATE_LIMIT_WINDOW_MS, 60 * 1000),
+    max: num(process.env.PREAUTH_RATE_LIMIT_MAX, 600),
+    message: 'Too many requests from this network. Please try again shortly.',
+    code: 'RATE_LIMITED',
+  }),
+);
+
+/**
  * Backstop for everything else. Intentionally high — it exists to blunt a crude
  * flood, not to shape normal traffic.
  */
@@ -177,6 +213,7 @@ const globalLimiter = rateLimit(
 
 module.exports = {
   sharedStore,
+  preAuthLimiter,
   authLimiter,
   aiLimiter,
   writeLimiter,

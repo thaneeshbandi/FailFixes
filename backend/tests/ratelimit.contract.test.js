@@ -18,6 +18,7 @@
 
 const app = require('../app');
 const {
+  preAuthLimiter,
   authLimiter,
   writeLimiter,
   searchLimiter,
@@ -28,6 +29,7 @@ const {
 
 /** Every limiter, by identity, so a handler can be recognised in a route stack. */
 const LIMITERS = new Map([
+  [preAuthLimiter, 'preAuthLimiter'],
   [authLimiter, 'authLimiter'],
   [writeLimiter, 'writeLimiter'],
   [searchLimiter, 'searchLimiter'],
@@ -191,5 +193,88 @@ describe('⏱️  Limiter keying strategy', () => {
       expect(typeof fn.resetKey).toBe('function'); // express-rate-limit surface
       expect(name).toBeTruthy();
     }
+  });
+});
+
+/**
+ * Routes where the authentication middleware itself is rate limited.
+ *
+ * CodeQL flagged these four with `js/missing-rate-limiting` pointing at the
+ * `auth` token, not at the controller: `protect` verifies a JWT and then issues
+ * User.findById(), and a limiter placed after it does not bound that work.
+ */
+const PRE_AUTH_ROUTES = [
+  ['post', '/api/auth/logout', 'writeLimiter'],
+  ['put', '/api/auth/change-password', 'authLimiter'],
+  ['get', '/api/users/search', 'searchLimiter'],
+  ['get', '/api/users/me/liked', 'searchLimiter'],
+];
+
+describe('🛡️  Authentication itself is rate limited (defence in depth)', () => {
+  test.each(PRE_AUTH_ROUTES)(
+    'A · %s %s runs preAuthLimiter BEFORE auth',
+    (method, path) => {
+      const stack = stackFor(method, path);
+      expect(stack).not.toBeNull();
+
+      const preIdx = stack.findIndex((s) => s.limiter === 'preAuthLimiter');
+      const authIdx = stack.findIndex((s) => s.name === REQUIRED_AUTH);
+
+      expect(preIdx).toBeGreaterThanOrEqual(0);
+      expect(authIdx).toBeGreaterThanOrEqual(0);
+      expect(preIdx).toBeLessThan(authIdx);
+    },
+  );
+
+  test.each(PRE_AUTH_ROUTES)(
+    'B · %s %s still runs its user-aware limiter (%s) AFTER auth',
+    (method, path, expected) => {
+      // The pre-auth gate must ADD protection, never replace the per-account one.
+      const stack = stackFor(method, path);
+      const authIdx = stack.findIndex((s) => s.name === REQUIRED_AUTH);
+      const userIdx = stack.findIndex((s) => s.limiter === expected);
+
+      expect(userIdx).toBeGreaterThanOrEqual(0);
+      expect(authIdx).toBeLessThan(userIdx);
+    },
+  );
+
+  test.each(PRE_AUTH_ROUTES)(
+    'C · %s %s has BOTH layers, in the order gate → auth → user limiter',
+    (method, path, expected) => {
+      const stack = stackFor(method, path);
+      const order = stack
+        .map((s, i) => ({ i, tag: s.limiter === 'preAuthLimiter' ? 'gate'
+                                 : s.name === REQUIRED_AUTH ? 'auth'
+                                 : s.limiter === expected ? 'user' : null }))
+        .filter((x) => x.tag);
+
+      expect(order.map((x) => x.tag)).toEqual(['gate', 'auth', 'user']);
+    },
+  );
+
+  test('C · the pre-auth gate is IP-keyed — it cannot be user-keyed by definition', () => {
+    // It runs before req.user exists. If someone gave it userOrIpKey it would
+    // silently key every caller by IP anyway, so the invariant worth asserting
+    // is that the user-aware limiters are NOT the ones running first.
+    for (const [method, path] of PRE_AUTH_ROUTES) {
+      const stack = stackFor(method, path);
+      const first = stack.find((s) => s.limiter);
+      expect(first.limiter).toBe('preAuthLimiter');
+    }
+  });
+
+  test('D · two users on one IP get separate user-aware buckets', () => {
+    const ip = '203.0.113.7';
+    const a = userOrIpKey({ user: { _id: 'userA' }, ip });
+    const b = userOrIpKey({ user: { _id: 'userB' }, ip });
+
+    expect(a).not.toBe(b);
+    expect(a).toBe('u:userA');
+    expect(b).toBe('u:userB');
+
+    // ...and only an unauthenticated caller collapses to the shared IP bucket,
+    // which is precisely why the gate is a separate, generous budget.
+    expect(userOrIpKey({ ip })).toBe(`ip:${ip}`);
   });
 });

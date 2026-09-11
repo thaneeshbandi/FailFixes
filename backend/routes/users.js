@@ -19,7 +19,7 @@ const {
 } = require('../controllers/userController');
 
 const { auth, optionalAuth } = require('../middleware/auth');
-const { writeLimiter, searchLimiter } = require('../middleware/rateLimit');
+const { preAuthLimiter, writeLimiter, searchLimiter } = require('../middleware/rateLimit');
 const {
   validateProfileUpdate,
   validateUsernameParam,
@@ -42,7 +42,9 @@ router.get('/suggested', auth, searchLimiter, getSuggestedUsers);
 
 // GET /api/users/search?q=... — the controller existed but was never mounted,
 // so the "start a chat with…" people-picker in the UI always received a 404.
-router.get('/search', auth, searchLimiter, validateSearch, searchUsers);
+// preAuthLimiter bounds the authentication work itself; searchLimiter stays
+// after `auth` so the listing budget remains per-account.
+router.get('/search', preAuthLimiter, auth, searchLimiter, validateSearch, searchUsers);
 
 router.post('/profile/:userId/view', auth, writeLimiter, validateUserIdParam, trackProfileView);
 router.get('/profile/:username', validateUsernameParam, optionalAuth, getUserProfileByUsername);
@@ -51,7 +53,14 @@ router.get('/me/stats', auth, getUserStats);
 router.get('/me/stories', auth, validatePagination, getUserStories);
 // $in lookup + populate + countDocuments; listing budget, after `auth` so the
 // limiter keys per user.
-router.get('/me/liked', auth, searchLimiter, validatePagination, getLikedStories);
+router.get(
+  '/me/liked',
+  preAuthLimiter,
+  auth,
+  searchLimiter,
+  validatePagination,
+  getLikedStories,
+);
 router.get('/me/profile', auth, getUserProfile);
 // Field allowlist is enforced in the controller (utils/allowedUpdates.js);
 // validateProfileUpdate additionally type/length-checks the allowed fields.

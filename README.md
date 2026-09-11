@@ -392,18 +392,38 @@ Regression tests: `backend/tests/cache.security.test.js`.
 
 ## Rate limiting
 
-Six tiers, sized by what a request actually costs, not one global number.
+Seven tiers, sized by what a request actually costs, not one global number.
 
 | Limiter | Applies to | Limit | Keyed by |
 |---|---|---|---|
+| `preAuthLimiter` | runs **before** `auth` on `/auth/logout`, `/auth/change-password`, `/users/search`, `/users/me/liked` | 600 / min | IP |
 | `authLimiter` | register, login, change-password | 10 / 15 min | IP |
 | `aiLimiter` | `POST /api/ai/generate-story` | 20 / hour | user id |
-| `writeLimiter` | story/comment/follow/profile writes, chat create, mark-read | 100 / 15 min | user id |
+| `writeLimiter` | story/comment/follow/profile writes, chat create, mark-read, logout | 100 / 15 min | user id |
 | `viewLimiter` | `POST /api/stories/:id/view` | 120 / 5 min | IP |
-| `searchLimiter` | story listing, user search, suggestions | 100 / 5 min | user id or IP |
+| `searchLimiter` | story listing, user search, suggestions, chat reads, liked stories | 100 / 5 min | user id or IP |
 | `globalLimiter` | backstop (defined, not currently mounted) | 1000 / 15 min | IP |
 
 All are overridable by environment variable (see below).
+
+**Two layers, not one.** `protect` verifies a JWT and then issues a
+`User.findById()`, so a limiter placed *after* it bounds the controller but not
+that work — a caller could force one signature check and one database read per
+request indefinitely, including on requests ultimately answered `429`. On the
+four routes above, an IP-keyed gate therefore runs *before* `auth`, and the
+user-aware limiter still runs *after* it:
+
+```
+request → preAuthLimiter (IP) → auth → writeLimiter/searchLimiter (user) → controller
+```
+
+The gate cannot be user-keyed — it runs before `req.user` exists, which is
+precisely the point. Its budget is deliberately generous (10/sec per IP) so a
+shared office or carrier-grade NAT is never throttled; it exists to blunt a
+flood by orders of magnitude, not to shape normal traffic. The user-aware
+limiters are what provide per-account fairness, and the gate does not replace
+them. Ordering is asserted by `backend/tests/ratelimit.contract.test.js` and the
+runtime behaviour by `backend/tests/preauth.runtime.test.js`.
 
 **Storage** — counters live in Redis when `REDIS_URL` is set, so a limit survives
 a restart and is shared across instances. Each limiter has its own key prefix so
@@ -620,7 +640,7 @@ alerting, error tracking.
 | `CORS_ORIGIN` | no | – | Extra CORS origins, comma-separated |
 | `JWT_EXPIRE` | no | `2d` | |
 | `GROQ_API_KEY` | no | – | Absent ⇒ AI endpoint returns 503 |
-| `RATE_LIMIT_WINDOW_MS`, `AUTH_RATE_LIMIT_MAX`, `AI_RATE_LIMIT_*`, `WRITE_RATE_LIMIT_*`, `VIEW_RATE_LIMIT_*`, `SEARCH_RATE_LIMIT_*`, `RATE_LIMIT_MAX_REQUESTS` | no | see table above | |
+| `RATE_LIMIT_WINDOW_MS`, `AUTH_RATE_LIMIT_MAX`, `AI_RATE_LIMIT_*`, `WRITE_RATE_LIMIT_*`, `VIEW_RATE_LIMIT_*`, `SEARCH_RATE_LIMIT_*`, `PREAUTH_RATE_LIMIT_*`, `RATE_LIMIT_MAX_REQUESTS` | no | see table above | Raise `PREAUTH_RATE_LIMIT_MAX` behind unusually dense NAT |
 | `DB_MAX_POOL_SIZE` / `DB_MIN_POOL_SIZE` | no | `10` / `1` | |
 
 `RESEND_API_KEY` is read by `utils/emailService.js`, which nothing imports.

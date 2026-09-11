@@ -345,13 +345,27 @@ app.use("/api/ai", aiRoutes);
  * that look like they came from the server, or hide their own activity.
  *
  * A wider allowlist than the one used for `X-Request-Id` above: a URL needs
- * `/ ? & = %` to stay diagnostically useful, so the rule here is "printable
- * ASCII only", which still removes every newline and control character. The
- * length cap bounds how much an attacker can write into the log per request.
+ * `/ ? & = %` to stay diagnostically useful, so the rule here keeps printable
+ * ASCII. The length cap bounds how much an attacker can write per request.
+ *
+ * ORDER OF THE TWO REPLACEMENTS IS DELIBERATE. Stripping CR and LF explicitly
+ * comes first even though the printable-ASCII pass that follows would remove
+ * them anyway. Two reasons:
+ *
+ *   1. Intent. The line-break characters are the actual attack — everything
+ *      else is defence in depth — so the code should say which one it is for.
+ *   2. CodeQL's `js/log-injection` model recognises a replacement that targets
+ *      `\r`/`\n` as a sanitiser. It does not infer that the negated class
+ *      `[^\x20-\x7E]` happens to exclude them, so with only the second pass the
+ *      value still reads as tainted at the sink and the alert persists.
  */
 const sanitizeForLog = (value, maxLength = 200) =>
   String(value)
+    // 1. the injection vector itself: no forged log lines
+    .replace(/[\r\n]/g, "")
+    // 2. everything else non-printable (NUL, BEL, ESC and friends)
     .replace(/[^\x20-\x7E]/g, "")
+    // 3. bound the volume one request can write
     .slice(0, maxLength);
 
 // ✅ 404 Handler
